@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+recursive-include TechRegParser/skills **/*
+recursive-exclude * __pycache__
+recursive-exclude * *.pyc
+exclude *.pdf
+exclude *.json
+exclude viewer.html
+exclude nul

@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "techreg-parser"
+version = "0.1.0"
+description = "Multi-agent system for extracting requirements from data privacy and tech regulation statutes"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "rafal-fryc"}
+]
+keywords = ["statute", "legal", "privacy", "compliance", "ai", "agent", "tech-regulation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Legal Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: General",
+]
+
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+pdf = [
+    "pypdf>=3.0.0",
+    "pdfplumber>=0.9.0",
+]
+
+[project.scripts]
+techreg-parser = "TechRegParser.main:run"
+
+[project.urls]
+Homepage = "https://github.com/rafal-fryc/TechRegParser"
+Documentation = "https://github.com/rafal-fryc/TechRegParser#readme"
+Repository = "https://github.com/rafal-fryc/TechRegParser"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["TechRegParser*"]
+
+[tool.setuptools.package-data]
+"TechRegParser" = ["skills/**/*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
