@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "techreg-parser"
-version = "0.1.0"
+version = "0.1.3"
 description = "Multi-agent system for extracting requirements from data privacy and tech regulation statutes"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "rafal-fryc"}
 ]
@@ -16,7 +16,7 @@ keywords = ["statute", "legal", "privacy", "compliance", "ai", "agent", "tech-re
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Legal Industry",
-    "License :: OSI Approved :: MIT License",
+
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -55,7 +55,7 @@ where = ["."]
 include = ["TechRegParser*"]
 
 [tool.setuptools.package-data]
-"TechRegParser" = ["skills/**/*"]
+"TechRegParser" = ["skills/**/*", "viewer.html"]
 
 [tool.black]
 line-length = 100

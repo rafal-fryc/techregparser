@@ -7,6 +7,7 @@ from .statute_structure import (
     StatuteSection,
     SectionType,
     Definition,
+    LegislativeIntent,
     AnalysisResult,
 )
 
@@ -18,5 +19,6 @@ __all__ = [
     "StatuteSection",
     "SectionType",
     "Definition",
+    "LegislativeIntent",
     "AnalysisResult",
 ]

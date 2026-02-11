@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Literal
+from typing import Optional
 import uuid
 
 from .citation import Citation
@@ -14,12 +14,12 @@ class RequirementCategory(str, Enum):
     DISCLOSURE: Must be stated in privacy policy/notice
     OPERATIONAL: Internal compliance process (response times, procedures)
     TECHNICAL: System/UI implementation (GPC signals, security measures, link placement, UI elements)
-    ENFORCEMENT: Enforcement mechanisms, penalties, prohibited conduct, AG authority, cure periods
+    LEGAL_FRAMEWORK: Applicability, exemptions, scope, enforcement mechanisms, penalties, AG authority, cure periods
     """
     DISCLOSURE = "disclosure"
     OPERATIONAL = "operational"
     TECHNICAL = "technical"
-    ENFORCEMENT = "enforcement"
+    LEGAL_FRAMEWORK = "legal_framework"
     UNCLASSIFIED = "unclassified"
 
 
@@ -43,7 +43,7 @@ class Requirement:
     citation: Citation
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     category: RequirementCategory = RequirementCategory.UNCLASSIFIED
-    applies_to: Literal["controller", "processor", "consumer", "both", "all"] = "controller"
+    applies_to: str = "controller"
     conditions: list[str] = field(default_factory=list)
     verified: bool = False
     confidence: float = 0.0
@@ -77,7 +77,9 @@ class Requirement:
             description=data["description"],
             citation=Citation.from_dict(data["citation"]),
             category=RequirementCategory(
-                "technical" if data.get("category") == "ui" else data.get("category", "unclassified")
+                "technical" if data.get("category") == "ui"
+                else "legal_framework" if data.get("category") == "enforcement"
+                else data.get("category", "unclassified")
             ),
             applies_to=data.get("applies_to", "controller"),
             conditions=data.get("conditions", []),

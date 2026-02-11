@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Statute Analysis Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --mahogany: #4A1A0A;
+  --mahogany-light: #6B2D1A;
+  --leather: #8B4513;
+  --brass: #B8860B;
+  --brass-light: #D4A843;
+  --gold-leaf: #C5A55A;
+  --parchment: #F5F0E8;
+  --parchment-dark: #EDE6D6;
+  --cream: #FDFBF7;
+  --ink: #2C1810;
+  --ink-light: #5C4033;
+  --ink-faint: #8B7355;
+  --rule: #D4C5A9;
+  --rule-dark: #B8A88A;
+}
+
+body {
+  font-family: 'EB Garamond', 'Georgia', 'Times New Roman', serif;
+  background: var(--parchment);
+  color: var(--ink);
+  line-height: 1.6;
+  font-size: 16px;
+}
+
+/* Header */
+.header {
+  background: var(--mahogany);
+  border-bottom: 3px solid var(--brass);
+  color: var(--parchment);
+  padding: 14px 28px;
+  display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+}
+.header h1 {
+  font-size: 22px; font-weight: 600; white-space: nowrap;
+  letter-spacing: 0.5px;
+  color: var(--parchment);
+}
+.header .file-controls { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+.header .filename {
+  font-size: 14px; color: var(--gold-leaf); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; font-style: italic;
+}
+
+.btn {
+  background: var(--leather); color: var(--parchment); border: 1px solid var(--brass);
+  padding: 5px 16px; font-size: 14px; cursor: pointer;
+  font-family: inherit; letter-spacing: 0.3px;
+}
+.btn:hover { background: var(--mahogany-light); }
+.btn-sm { padding: 4px 12px; font-size: 13px; }
+
+/* Drop overlay */
+.drop-overlay {
+  display: none; position: fixed; inset: 0;
+  background: rgba(44,24,16,.88);
+  z-index: 999; justify-content: center; align-items: center;
+  font-size: 24px; color: var(--parchment); font-style: italic;
+}
+.drop-overlay.active { display: flex; }
+
+/* Container */
+.container { max-width: 1100px; margin: 0 auto; padding: 24px 20px; }
+
+/* Landing */
+.landing { text-align: center; padding: 80px 20px; color: var(--ink-faint); }
+.landing h2 { font-size: 26px; color: var(--mahogany); margin-bottom: 6px; font-weight: 500; }
+.landing p { margin-bottom: 20px; font-size: 17px; font-style: italic; }
+
+/* Summary */
+.summary { display: none; margin-bottom: 24px; }
+.summary-header {
+  margin-bottom: 16px; padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.summary-header h2 { font-size: 26px; color: var(--mahogany); font-weight: 600; }
+.summary-header p { font-size: 15px; color: var(--ink-faint); font-style: italic; }
+
+.stat-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.stat-card {
+  background: var(--cream); border: 1px solid var(--rule);
+  padding: 14px 16px;
+}
+.stat-card .label {
+  font-size: 12px; text-transform: uppercase; color: var(--ink-faint);
+  letter-spacing: 1px; font-family: 'EB Garamond', Georgia, serif;
+}
+.stat-card .value { font-size: 28px; font-weight: 700; color: var(--mahogany); }
+
+.category-bar-container {
+  background: var(--cream); border: 1px solid var(--rule);
+  padding: 14px 16px; margin-bottom: 16px;
+}
+.category-bar-container h3 {
+  font-size: 13px; color: var(--ink-faint); margin-bottom: 8px;
+  text-transform: uppercase; letter-spacing: 1px;
+}
+.cat-bar { display: flex; height: 24px; overflow: hidden; border: 1px solid var(--rule-dark); }
+.cat-bar span {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: #fff; font-weight: 600; min-width: 0; transition: flex .3s;
+}
+.cat-legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 14px; color: var(--ink-light); }
+.cat-legend i { display: inline-block; width: 10px; height: 10px; margin-right: 5px; vertical-align: middle; }
+
+/* Toolbar */
+.toolbar {
+  display: none; background: var(--cream); border: 1px solid var(--rule);
+  padding: 12px 16px; margin-bottom: 16px;
+  display: none; flex-wrap: wrap; gap: 10px; align-items: center;
+}
+.toolbar input[type="text"] {
+  flex: 1; min-width: 180px; padding: 5px 10px; border: 1px solid var(--rule-dark);
+  background: var(--parchment); font-size: 15px; font-family: inherit; color: var(--ink);
+}
+.toolbar input[type="text"]::placeholder { color: var(--ink-faint); font-style: italic; }
+.cat-toggles { display: flex; gap: 4px; flex-wrap: wrap; }
+.cat-toggle {
+  padding: 2px 10px; font-size: 13px; font-weight: 600;
+  border: 1.5px solid; cursor: pointer; transition: .15s;
+  background: var(--cream); font-family: inherit;
+}
+.cat-toggle.active { color: #fff !important; }
+.verified-btns { display: flex; gap: 0; }
+.verified-btns button {
+  padding: 4px 12px; border: 1px solid var(--rule-dark); background: var(--cream);
+  font-size: 13px; cursor: pointer; font-family: inherit; color: var(--ink);
+}
+.verified-btns button:first-child { border-right: 0; }
+.verified-btns button:last-child { border-left: 0; }
+.verified-btns button.active { background: var(--mahogany); color: var(--parchment); border-color: var(--mahogany); }
+.confidence-group { display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--ink-faint); }
+.confidence-group input[type="range"] { width: 100px; accent-color: var(--leather); }
+.showing-count { font-size: 14px; color: var(--ink-faint); margin-left: auto; white-space: nowrap; font-style: italic; }
+
+/* Tabs */
+.tabs-container { display: none; }
+.tab-bar {
+  display: flex; gap: 0; border-bottom: 2px solid var(--rule-dark); margin-bottom: 16px;
+}
+.tab-btn {
+  padding: 8px 20px; font-size: 15px; font-weight: 600; cursor: pointer;
+  border: none; background: none; color: var(--ink-faint);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px; font-family: inherit; letter-spacing: 0.3px;
+}
+.tab-btn:hover { color: var(--ink-light); }
+.tab-btn.active { color: var(--mahogany); border-bottom-color: var(--brass); }
+.tab-badge {
+  background: #9B2C2C; color: #fff; font-size: 11px; padding: 1px 6px;
+  margin-left: 6px; font-weight: 700;
+}
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* Cards */
+.card {
+  background: var(--cream); border: 1px solid var(--rule);
+  padding: 14px 18px; margin-bottom: 10px;
+  border-left: 3px solid var(--rule-dark);
+}
+.card-header {
+  display: flex; align-items: flex-start; gap: 8px; cursor: pointer;
+  user-select: none;
+}
+.card-header .arrow {
+  font-size: 11px; color: var(--ink-faint); transition: transform .15s;
+  flex-shrink: 0; margin-top: 4px;
+}
+.card-header .arrow.open { transform: rotate(90deg); }
+.card-body {
+  display: none; margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--rule); font-size: 15px;
+}
+.card-body.open { display: block; }
+
+.badge {
+  display: inline-block; padding: 1px 8px;
+  font-size: 12px; font-weight: 600; color: #fff; flex-shrink: 0;
+}
+.verified-icon { font-size: 14px; flex-shrink: 0; color: var(--ink-faint); }
+.confidence-bar-small {
+  width: 56px; height: 5px; background: var(--rule);
+  flex-shrink: 0; overflow: hidden; margin-top: 7px;
+}
+.confidence-bar-small .fill { height: 100%; }
+.card-desc { flex: 1; font-size: 15px; color: var(--ink); }
+
+.detail-row { margin-bottom: 8px; }
+.detail-label {
+  font-weight: 600; color: var(--ink-faint); font-size: 12px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.detail-value { color: var(--ink); }
+blockquote {
+  border-left: 2px solid var(--brass); padding: 8px 14px; margin: 6px 0;
+  background: var(--parchment); font-style: italic; color: var(--ink-light); font-size: 15px;
+}
+.conditions-list { list-style: none; padding-left: 0; }
+.conditions-list li { margin-bottom: 3px; padding-left: 16px; position: relative; }
+.conditions-list li::before { content: "\2014"; position: absolute; left: 0; color: var(--ink-faint); }
+
+/* Error card */
+.card.error-card { border-left-color: #9B2C2C; }
+.error-msg {
+  background: #F9E8E8; color: #7B1E1E; padding: 8px 12px;
+  font-size: 14px; margin-top: 8px; border-left: 2px solid #9B2C2C;
+}
+
+/* Definition card */
+.def-card { border-left-color: var(--brass); }
+.def-term { font-weight: 700; font-size: 18px; color: var(--mahogany); }
+.def-section { font-size: 14px; color: var(--ink-faint); font-style: italic; }
+.def-text { margin-top: 4px; font-size: 15px; color: var(--ink); }
+.def-notes { margin-top: 4px; font-size: 14px; color: var(--ink-faint); font-style: italic; }
+
+/* Structure tree */
+.tree-controls { margin-bottom: 12px; }
+.tree-node { margin-left: 0; }
+.tree-node .tree-node { margin-left: 22px; border-left: 1px solid var(--rule); padding-left: 0; }
+.tree-item {
+  background: var(--cream); border: 1px solid var(--rule);
+  padding: 8px 14px; margin-bottom: 4px; cursor: pointer; user-select: none;
+}
+.tree-item:hover { background: var(--parchment-dark); }
+.tree-item-header { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+.tree-item-header .arrow { font-size: 10px; color: var(--ink-faint); transition: transform .15s; }
+.tree-item-header .arrow.open { transform: rotate(90deg); }
+.tree-item-header .arrow.leaf { visibility: hidden; }
+.tree-children { display: none; }
+.tree-children.open { display: block; }
+.tree-content { font-size: 14px; color: var(--ink-faint); margin-top: 4px; max-height: 60px; overflow: hidden; font-style: italic; }
+.tree-meta { font-size: 12px; color: var(--ink-faint); }
+.type-badge {
+  display: inline-block; padding: 0px 6px; font-size: 11px;
+  font-weight: 600; background: var(--parchment-dark); color: var(--ink-light);
+  border: 1px solid var(--rule);
+}
+
+/* Statute reconstruction view */
+.statute-doc { max-width: 1060px; margin: 0 auto; }
+.statute-title-block { text-align: center; margin-bottom: 28px; padding-bottom: 16px; border-bottom: 2px solid var(--rule-dark); }
+.statute-title-block h2 { font-size: 24px; font-weight: 700; color: var(--mahogany); margin-bottom: 2px; text-transform: uppercase; letter-spacing: 1px; }
+.statute-title-block .statute-citation { font-size: 15px; color: var(--ink-faint); font-style: italic; }
+.statute-title-block .statute-effective { font-size: 14px; color: var(--ink-faint); margin-top: 2px; }
+
+.statute-intent { margin-bottom: 24px; padding: 16px 20px; background: var(--parchment-dark); border: 1px solid var(--rule); }
+.statute-intent h3 { font-size: 16px; font-weight: 600; color: var(--mahogany); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+.statute-intent p { font-size: 15px; margin-bottom: 6px; }
+.statute-intent ul { padding-left: 24px; font-size: 15px; }
+.statute-intent li { margin-bottom: 4px; }
+
+/* Section: two-column layout — statute text left, annotations right */
+.statute-sec { margin-bottom: 24px; }
+.statute-sec-heading {
+  font-size: 17px; font-weight: 700; color: var(--mahogany);
+  margin-bottom: 8px; padding-bottom: 4px;
+  border-bottom: 1px solid var(--rule);
+}
+.statute-sec-heading .sec-id { font-variant-numeric: lining-nums; }
+.statute-sec-heading .sec-type {
+  font-size: 11px; font-weight: 600; color: var(--ink-faint);
+  background: var(--parchment-dark); border: 1px solid var(--rule);
+  padding: 0 6px; margin-left: 8px; vertical-align: middle;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.statute-sec-content { display: grid; grid-template-columns: 1fr 220px; gap: 16px; align-items: start; }
+.statute-sec-content.no-annotations { grid-template-columns: 1fr; }
+.statute-sec-main { min-width: 0; }
+.statute-sec-margin { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+
+.statute-subsec { margin-left: 24px; margin-bottom: 16px; }
+.statute-subsec .statute-sec-heading { font-size: 15px; border-bottom: none; margin-bottom: 4px; }
+.statute-body { font-size: 15.5px; line-height: 1.7; color: var(--ink); margin-bottom: 8px; }
+.statute-body:empty { display: none; }
+.statute-list { margin: 6px 0 6px 8px; padding-left: 24px; font-size: 15.5px; line-height: 1.7; color: var(--ink); }
+.statute-list li { margin-bottom: 4px; padding-left: 4px; }
+.statute-list .statute-list { margin-top: 4px; margin-bottom: 4px; font-size: inherit; }
+
+/* Requirement annotations — small margin notes */
+.statute-req {
+  padding: 6px 8px;
+  border-left: 3px solid var(--rule-dark);
+  background: var(--cream); border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule); border-right: 1px solid var(--rule);
+  font-size: 12px; line-height: 1.4;
+}
+.statute-req-desc { color: var(--ink); font-weight: 500; margin-bottom: 3px; }
+.statute-req-meta {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  font-size: 11px; color: var(--ink-faint);
+}
+.statute-req .verified-icon { font-size: 11px; }
+
+/* Definitions block */
+.statute-defs { margin-bottom: 24px; }
+.statute-def-entry { margin-bottom: 10px; padding-left: 16px; font-size: 15.5px; line-height: 1.6; }
+.statute-def-entry .def-term-inline { font-weight: 700; color: var(--ink); }
+.statute-def-entry .def-section-ref { font-size: 13px; color: var(--ink-faint); font-style: italic; margin-left: 6px; }
+
+/* Orphan / fallback */
+.statute-orphan-header {
+  font-size: 17px; font-weight: 600; color: var(--ink-faint);
+  margin-bottom: 8px; padding-top: 16px;
+  border-top: 2px solid var(--rule-dark);
+}
+
+@media (max-width: 760px) {
+  .statute-sec-content { grid-template-columns: 1fr; }
+  .statute-sec-margin { flex-direction: row; flex-wrap: wrap; }
+  .statute-req { flex: 1 1 180px; }
+}
+
+/* Category colors — muted, library-appropriate */
+.cat-disclosure { background: #3D5A80; }
+.cat-operational { background: #5B4970; }
+.cat-technical { background: #7B3B3B; }
+.cat-legal_framework { background: #7D5A1E; }
+.cat-unclassified { background: #777060; }
+
+.border-disclosure { border-left-color: #3D5A80; }
+.border-operational { border-left-color: #5B4970; }
+.border-technical { border-left-color: #7B3B3B; }
+.border-legal_framework { border-left-color: #7D5A1E; }
+.border-unclassified { border-left-color: #777060; }
+
+/* Toast */
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  background: var(--mahogany); color: var(--parchment); padding: 10px 24px;
+  font-size: 15px; z-index: 1000; opacity: 0; transition: opacity .3s;
+  pointer-events: none; border: 1px solid var(--brass); font-style: italic;
+}
+.toast.show { opacity: 1; }
+
+/* Responsive */
+@media (max-width: 640px) {
+  .header { padding: 10px 14px; }
+  .header h1 { font-size: 18px; }
+  .container { padding: 14px 10px; }
+  .stat-cards { grid-template-columns: repeat(2, 1fr); }
+  .toolbar { gap: 8px; }
+  .tab-btn { padding: 6px 10px; font-size: 14px; }
+}
+</style>
+</head>
+<body>
+
+<div class="drop-overlay" id="dropOverlay">Drop JSON file to load&hellip;</div>
+
+<header class="header">
+  <h1>Statute Analysis Viewer</h1>
+  <div class="file-controls">
+    <button class="btn btn-sm" onclick="document.getElementById('fileInput').click()">Load File</button>
+    <input type="file" id="fileInput" accept=".json" style="display:none">
+    <span class="filename" id="fileName">No file loaded</span>
+  </div>
+</header>
+
+<div class="container">
+  <div class="landing" id="landing">
+    <h2>Load a Statute Analysis File</h2>
+    <p>Select a file or drag and drop a .json analysis onto this page.</p>
+  </div>
+
+  <div class="summary" id="summary">
+    <div class="summary-header">
+      <h2 id="statuteName"></h2>
+      <p id="effectiveDate"></p>
+    </div>
+    <div class="stat-cards" id="statCards"></div>
+    <div class="category-bar-container">
+      <h3>Category Breakdown</h3>
+      <div class="cat-bar" id="catBar"></div>
+      <div class="cat-legend" id="catLegend"></div>
+    </div>
+  </div>
+
+  <div class="toolbar" id="toolbar">
+    <input type="text" id="searchInput" placeholder="Search descriptions, citations, conditions&hellip;">
+    <div class="cat-toggles" id="catToggles"></div>
+    <div class="verified-btns" id="verifiedBtns">
+      <button class="active" data-val="all">All</button>
+      <button data-val="verified">Verified</button>
+      <button data-val="unverified">Unverified</button>
+    </div>
+    <div class="confidence-group">
+      <label>Confidence &ge;</label>
+      <input type="range" id="confSlider" min="0" max="100" value="0">
+      <span id="confValue">0%</span>
+    </div>
+    <span class="showing-count" id="showingCount"></span>
+  </div>
+
+  <div class="tabs-container" id="tabsContainer">
+    <div class="tab-bar" id="tabBar">
+      <button class="tab-btn active" data-tab="statute">Statute</button>
+      <button class="tab-btn" data-tab="requirements">Requirements</button>
+      <button class="tab-btn" data-tab="definitions">Definitions</button>
+      <button class="tab-btn" data-tab="structure">Structure</button>
+      <button class="tab-btn" data-tab="unverified">Unverified <span class="tab-badge" id="unverifiedBadge" style="display:none">0</span></button>
+    </div>
+    <div class="tab-panel active" id="panel-statute"></div>
+    <div class="tab-panel" id="panel-requirements"></div>
+    <div class="tab-panel" id="panel-definitions"></div>
+    <div class="tab-panel" id="panel-structure"></div>
+    <div class="tab-panel" id="panel-unverified"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ── Globals ──
+const CAT_COLORS = {
+  disclosure: '#3D5A80', operational: '#5B4970',
+  technical: '#7B3B3B', legal_framework: '#7D5A1E', unclassified: '#777060'
+};
+const CAT_NAMES = { disclosure:'Disclosure', operational:'Operational', technical:'Technical', legal_framework:'Legal Framework', unclassified:'Unclassified' };
+
+const appState = {
+  data: null,
+  filters: { search: '', categories: new Set(Object.keys(CAT_COLORS)), verified: 'all', confidence: 0 },
+  expandedReqs: new Set(),
+  expandedTree: new Set()
+};
+
+// ── Utilities ──
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function confColor(c) {
+  if (c >= 0.9) return '#2D6A4F';
+  if (c >= 0.7) return '#926C15';
+  if (c >= 0.5) return '#A0522D';
+  return '#9B2C2C';
+}
+
+function confPct(c) { return Math.round((c || 0) * 100) + '%'; }
+
+function catClass(cat) {
+  if (cat === 'ui') return 'technical';
+  if (cat === 'enforcement') return 'legal_framework';
+  return CAT_COLORS[cat] ? cat : 'unclassified';
+}
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+let searchTimer;
+function debounce(fn, ms) {
+  return function() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(fn, ms);
+  };
+}
+
+// ── File Loading ──
+document.getElementById('fileInput').addEventListener('change', e => {
+  if (e.target.files[0]) readFile(e.target.files[0]);
+});
+
+document.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('dropOverlay').classList.add('active'); });
+document.addEventListener('dragleave', e => { if (e.relatedTarget === null) document.getElementById('dropOverlay').classList.remove('active'); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  document.getElementById('dropOverlay').classList.remove('active');
+  const f = e.dataTransfer.files[0];
+  if (f && f.name.endsWith('.json')) readFile(f);
+  else toast('Please drop a .json file');
+});
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const data = JSON.parse(reader.result);
+      validateData(data);
+      appState.data = data;
+      appState.expandedReqs.clear();
+      appState.expandedTree.clear();
+      appState.filters = { search: '', categories: new Set(Object.keys(CAT_COLORS)), verified: 'all', confidence: 0 };
+      document.getElementById('fileName').textContent = file.name;
+      document.getElementById('searchInput').value = '';
+      document.getElementById('confSlider').value = 0;
+      document.getElementById('confValue').textContent = '0%';
+      renderAll();
+      toast('Loaded ' + file.name);
+    } catch (err) {
+      toast('Error: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function validateData(d) {
+  if (!d || typeof d !== 'object') throw new Error('Invalid JSON structure');
+  if (!Array.isArray(d.requirements)) throw new Error('Missing requirements array');
+}
+
+// ── Master Render ──
+function renderAll() {
+  const d = appState.data;
+  document.getElementById('landing').style.display = 'none';
+  document.getElementById('summary').style.display = 'block';
+  document.getElementById('toolbar').style.display = 'flex';
+  document.getElementById('tabsContainer').style.display = 'block';
+
+  renderSummary(d);
+  renderCatToggles();
+  renderVerifiedBtns();
+  renderRequirements();
+  renderDefinitions();
+  renderStructure();
+  renderStatute();
+  renderUnverified();
+}
+
+// ── Summary ──
+function renderSummary(d) {
+  document.getElementById('statuteName').textContent = d.statute_name || 'Untitled Statute';
+  document.getElementById('effectiveDate').textContent = d.effective_date || '';
+
+  const reqs = d.requirements || [];
+  const total = d.metadata?.total_requirements ?? reqs.length;
+  const verified = d.metadata?.verified_count ?? reqs.filter(r => r.verified).length;
+  const unverified = total - verified;
+  const avgConf = reqs.length ? reqs.reduce((s, r) => s + (r.confidence || 0), 0) / reqs.length : 0;
+
+  document.getElementById('statCards').innerHTML = [
+    { label: 'Total Requirements', value: total },
+    { label: 'Verified', value: verified },
+    { label: 'Unverified', value: unverified },
+    { label: 'Avg Confidence', value: confPct(avgConf) }
+  ].map(c => `<div class="stat-card"><div class="label">${c.label}</div><div class="value">${c.value}</div></div>`).join('');
+
+  // Category bar
+  const counts = {};
+  for (const cat of Object.keys(CAT_COLORS)) counts[cat] = 0;
+  reqs.forEach(r => { const c = catClass(r.category); counts[c] = (counts[c] || 0) + 1; });
+  const barHtml = Object.entries(counts).filter(([,v]) => v > 0).map(([cat, v]) =>
+    `<span style="flex:${v};background:${CAT_COLORS[cat]}" title="${CAT_NAMES[cat]}: ${v}">${v > 0 ? v : ''}</span>`
+  ).join('');
+  document.getElementById('catBar').innerHTML = barHtml;
+
+  const legendHtml = Object.entries(counts).filter(([,v]) => v > 0).map(([cat, v]) =>
+    `<span><i style="background:${CAT_COLORS[cat]}"></i>${CAT_NAMES[cat]}: ${v}</span>`
+  ).join('');
+  document.getElementById('catLegend').innerHTML = legendHtml;
+
+  // Unverified badge
+  const uBadge = document.getElementById('unverifiedBadge');
+  const uCount = (d.unverified_items || []).length;
+  if (uCount > 0) { uBadge.textContent = uCount; uBadge.style.display = 'inline'; }
+  else { uBadge.style.display = 'none'; }
+}
+
+// ── Category Toggles ──
+function renderCatToggles() {
+  const el = document.getElementById('catToggles');
+  el.innerHTML = Object.entries(CAT_COLORS).map(([cat, color]) => {
+    const active = appState.filters.categories.has(cat);
+    return `<span class="cat-toggle${active ? ' active' : ''}" data-cat="${cat}"
+      style="border-color:${color};color:${active ? '#fff' : color};background:${active ? color : 'var(--cream)'}">${CAT_NAMES[cat]}</span>`;
+  }).join('');
+}
+
+// ── Verified Buttons ──
+function renderVerifiedBtns() {
+  document.querySelectorAll('#verifiedBtns button').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.val === appState.filters.verified);
+  });
+}
+
+// ── Requirements Tab ──
+function getFilteredReqs() {
+  const f = appState.filters;
+  const search = f.search.toLowerCase();
+  return (appState.data.requirements || []).filter(r => {
+    if (!f.categories.has(catClass(r.category))) return false;
+    if (f.verified === 'verified' && !r.verified) return false;
+    if (f.verified === 'unverified' && r.verified) return false;
+    if ((r.confidence || 0) < f.confidence / 100) return false;
+    if (search) {
+      const haystack = [r.description, r.citation?.section, r.citation?.quoted_text, ...(r.conditions || [])].join(' ').toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function renderRequirements() {
+  const reqs = getFilteredReqs();
+  const total = (appState.data.requirements || []).length;
+  document.getElementById('showingCount').textContent = `Showing ${reqs.length} of ${total}`;
+
+  const panel = document.getElementById('panel-requirements');
+  if (!reqs.length) { panel.innerHTML = '<p style="color:var(--ink-faint);text-align:center;padding:30px;font-style:italic">No requirements match the current filters.</p>'; return; }
+
+  panel.innerHTML = reqs.map(r => {
+    const cat = catClass(r.category);
+    const expanded = appState.expandedReqs.has(r.id);
+    const c = r.citation || {};
+    const lines = Array.isArray(c.line_numbers) ? `Lines ${c.line_numbers[0]}\u2013${c.line_numbers[1]}` : '';
+    const condHtml = (r.conditions || []).length
+      ? `<ul class="conditions-list">${r.conditions.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>` : '<span style="color:var(--ink-faint);font-style:italic">None</span>';
+
+    return `<div class="card border-${cat}" data-req-id="${escapeHtml(r.id)}">
+      <div class="card-header">
+        <span class="arrow${expanded ? ' open' : ''}">&#9654;</span>
+        <span class="badge cat-${cat}">${CAT_NAMES[cat] || cat}</span>
+        <span class="verified-icon" title="${r.verified ? 'Verified' : 'Unverified'}">${r.verified ? '&#10003;' : '&#9888;'}</span>
+        <div class="confidence-bar-small" title="Confidence: ${confPct(r.confidence)}"><div class="fill" style="width:${confPct(r.confidence)};background:${confColor(r.confidence)}"></div></div>
+        <span class="card-desc">${escapeHtml(r.description)}</span>
+      </div>
+      <div class="card-body${expanded ? ' open' : ''}">
+        ${c.section ? `<div class="detail-row"><span class="detail-label">Citation</span> <span class="detail-value">${escapeHtml(c.section)}</span></div>` : ''}
+        ${c.quoted_text ? `<blockquote>${escapeHtml(c.quoted_text)}</blockquote>` : ''}
+        <div class="detail-row"><span class="detail-label">Applies to</span> <span class="detail-value">${escapeHtml(r.applies_to) || '\u2014'}</span></div>
+        <div class="detail-row"><span class="detail-label">Conditions</span><div class="detail-value">${condHtml}</div></div>
+        ${r.obligation_type ? `<div class="detail-row"><span class="detail-label">Obligation</span> <span class="detail-value">${escapeHtml(r.obligation_type)}</span></div>` : ''}
+        ${r.source_section ? `<div class="detail-row"><span class="detail-label">Source Section</span> <span class="detail-value">${escapeHtml(r.source_section)}</span></div>` : ''}
+        ${lines ? `<div class="detail-row"><span class="detail-label">Lines</span> <span class="detail-value">${lines}</span></div>` : ''}
+        <div class="detail-row"><span class="detail-label">Confidence</span> <span class="detail-value" style="color:${confColor(r.confidence)};font-weight:600">${confPct(r.confidence)}</span></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Definitions Tab ──
+function renderDefinitions() {
+  const defs = appState.data.definitions;
+  if (!defs || typeof defs !== 'object') {
+    document.getElementById('panel-definitions').innerHTML = '<p style="color:var(--ink-faint);text-align:center;padding:30px;font-style:italic">No definitions available.</p>';
+    return;
+  }
+  const entries = Object.entries(defs).sort((a, b) => {
+    const ta = (a[1].term || a[0]).toLowerCase();
+    const tb = (b[1].term || b[0]).toLowerCase();
+    return ta.localeCompare(tb);
+  });
+
+  document.getElementById('panel-definitions').innerHTML = entries.map(([key, d]) => {
+    const term = d.term || key;
+    return `<div class="card def-card">
+      <div class="def-term">${escapeHtml(term)}</div>
+      ${d.section ? `<div class="def-section">${escapeHtml(d.section)}</div>` : ''}
+      <div class="def-text">${escapeHtml(d.definition)}</div>
+      ${d.notes ? `<div class="def-notes">${escapeHtml(d.notes)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Structure Tab ──
+function renderStructure() {
+  const sections = appState.data.structure?.sections;
+  if (!sections || !sections.length) {
+    document.getElementById('panel-structure').innerHTML = '<p style="color:var(--ink-faint);text-align:center;padding:30px;font-style:italic">No structure data available.</p>';
+    return;
+  }
+
+  const controlsHtml = `<div class="tree-controls">
+    <button class="btn btn-sm" id="expandAllBtn">Expand All</button>
+    <button class="btn btn-sm" id="collapseAllBtn" style="background:var(--ink-faint)">Collapse All</button>
+  </div>`;
+
+  document.getElementById('panel-structure').innerHTML = controlsHtml + renderTreeNodes(sections, 'root');
+}
+
+function renderTreeNodes(sections, parentPath) {
+  return sections.map((s, i) => {
+    const path = parentPath + '/' + i;
+    const hasSubs = s.subsections && s.subsections.length > 0;
+    const expanded = appState.expandedTree.has(path);
+    const title = s.title || s.id || '(untitled)';
+    const lineRange = (s.start_line || s.end_line) ? `L${s.start_line || '?'}\u2013${s.end_line || '?'}` : '';
+
+    return `<div class="tree-node">
+      <div class="tree-item" data-tree-path="${escapeHtml(path)}">
+        <div class="tree-item-header">
+          <span class="arrow${expanded ? ' open' : ''}${!hasSubs ? ' leaf' : ''}">${hasSubs ? '&#9654;' : ''}</span>
+          ${s.id ? `<strong>${escapeHtml(s.id)}</strong>` : ''}
+          <span>${escapeHtml(title)}</span>
+          ${s.section_type ? `<span class="type-badge">${escapeHtml(s.section_type)}</span>` : ''}
+          ${lineRange ? `<span class="tree-meta">${lineRange}</span>` : ''}
+        </div>
+        ${s.content ? `<div class="tree-content">${escapeHtml(s.content)}</div>` : ''}
+      </div>
+      ${hasSubs ? `<div class="tree-children${expanded ? ' open' : ''}">${renderTreeNodes(s.subsections, path)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Statute Tab ──
+function normalizeSectionId(s) {
+  if (!s) return '';
+  s = s.trim();
+  for (const p of ['Section ', 'Sec. ', '\u00a7 ', '\u00a7']) {
+    if (s.startsWith(p)) { s = s.slice(p.length).trim(); break; }
+  }
+  for (const m of [', Subd.', ', Subdivision', ',Subd.', ',Subdivision']) {
+    const idx = s.toLowerCase().indexOf(m.toLowerCase());
+    if (idx !== -1) { s = s.slice(0, idx).trim(); break; }
+  }
+  const paren = s.match(/^([^(]+)/);
+  if (paren) s = paren[1].trim();
+  return s;
+}
+
+function flattenSections(sections, out) {
+  if (!sections) return;
+  for (const sec of sections) {
+    out.push(sec);
+    if (sec.subsections && sec.subsections.length) {
+      flattenSections(sec.subsections, out);
+    }
+  }
+}
+
+// ── Statute text formatting (list detection) ──
+function romanToInt(s) {
+  const map = { i:1, v:5, x:10, l:50, c:100 };
+  let t = 0;
+  for (let i = 0; i < s.length; i++) {
+    const v = map[s[i]];
+    if (!v) return 0;
+    t += (i + 1 < s.length && v < map[s[i + 1]]) ? -v : v;
+  }
+  return t;
+}
+
+function classifyMarker(inner, allInners) {
+  if (/^\d+$/.test(inner)) return { type: 'numeric', ord: parseInt(inner) };
+  if (inner.length > 1 && /^[ivxlc]+$/.test(inner)) {
+    const v = romanToInt(inner);
+    if (v > 0) return { type: 'lowerRoman', ord: v };
+  }
+  if (inner.length > 1 && /^[IVXLC]+$/.test(inner)) {
+    const v = romanToInt(inner.toLowerCase());
+    if (v > 0) return { type: 'upperRoman', ord: v };
+  }
+  if (/^[a-z]$/.test(inner)) {
+    if ('ivxlcdm'.includes(inner)) {
+      const succ = { i:'ii', v:'vi', x:'xi' }[inner];
+      if (succ && allInners.has(succ)) return { type: 'lowerRoman', ord: romanToInt(inner) };
+    }
+    return { type: 'lowerAlpha', ord: inner.charCodeAt(0) - 96 };
+  }
+  if (/^[A-Z]$/.test(inner)) {
+    if ('IVXLCDM'.includes(inner)) {
+      const succ = { I:'II', V:'VI', X:'XI' }[inner];
+      if (succ && allInners.has(succ)) return { type: 'upperRoman', ord: romanToInt(inner.toLowerCase()) };
+    }
+    return { type: 'upperAlpha', ord: inner.charCodeAt(0) - 64 };
+  }
+  return null;
+}
+
+function formatStatuteText(raw) {
+  if (!raw) return '';
+  const re = /\((\d+|[a-z]{1,4}|[A-Z]{1,4})\)/g;
+  const allMarkers = [];
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    allMarkers.push({ index: m.index, len: m[0].length, inner: m[1] });
+  }
+  if (allMarkers.length < 2) return escapeHtml(raw);
+
+  const allInners = new Set(allMarkers.map(mk => mk.inner));
+  for (const mk of allMarkers) mk.cls = classifyMarker(mk.inner, allInners);
+
+  // Group by type
+  const byType = {};
+  for (const mk of allMarkers) {
+    if (!mk.cls) continue;
+    if (!byType[mk.cls.type]) byType[mk.cls.type] = [];
+    byType[mk.cls.type].push(mk);
+  }
+
+  // Find outermost list run: earliest start, 2+ items, ascending ordinals
+  let outerRun = null;
+  for (const mks of Object.values(byType)) {
+    if (mks.length < 2) continue;
+    let ok = true;
+    for (let i = 1; i < mks.length; i++) {
+      if (mks[i].cls.ord <= mks[i - 1].cls.ord) { ok = false; break; }
+    }
+    if (!ok) continue;
+    if (!outerRun || mks[0].index < outerRun[0].index) outerRun = mks;
+  }
+  if (!outerRun) return escapeHtml(raw);
+
+  const lead = raw.slice(0, outerRun[0].index).trim();
+  let html = lead ? escapeHtml(lead) : '';
+  const t = outerRun[0].cls.type;
+  const olType = t === 'numeric' ? '1' : t === 'lowerAlpha' ? 'a' : t === 'upperAlpha' ? 'A' : t === 'lowerRoman' ? 'i' : 'I';
+  html += `<ol class="statute-list" type="${olType}" start="${outerRun[0].cls.ord}">`;
+
+  for (let k = 0; k < outerRun.length; k++) {
+    const start = outerRun[k].index + outerRun[k].len;
+    const end = k + 1 < outerRun.length ? outerRun[k + 1].index : raw.length;
+    let item = raw.slice(start, end).trim()
+      .replace(/[;,]\s*$/, '').replace(/\s+and\s*$/i, '').replace(/\s+or\s*$/i, '');
+    html += `<li>${formatStatuteText(item)}</li>`;
+  }
+  html += '</ol>';
+  return html;
+}
+
+function renderStatute() {
+  const panel = document.getElementById('panel-statute');
+  const d = appState.data;
+  const reqs = d.requirements || [];
+  const sections = d.structure?.sections;
+  const defs = d.definitions || {};
+  const intent = d.legislative_intent;
+
+  // Build map: normalized section id → [requirements], sorted by line number
+  const reqsBySection = {};
+  for (const r of reqs) {
+    const key = normalizeSectionId(r.source_section);
+    if (!key) continue;
+    if (!reqsBySection[key]) reqsBySection[key] = [];
+    reqsBySection[key].push(r);
+  }
+  for (const key of Object.keys(reqsBySection)) {
+    reqsBySection[key].sort((a, b) => {
+      const la = a.citation?.line_numbers?.[0] || 0;
+      const lb = b.citation?.line_numbers?.[0] || 0;
+      return la - lb;
+    });
+  }
+
+  // Identify which sections are definitions type
+  const defSectionIds = new Set();
+  if (sections) {
+    const walk = (list) => {
+      for (const s of list) {
+        if (s.section_type === 'definitions') defSectionIds.add(normalizeSectionId(s.id));
+        if (s.subsections) walk(s.subsections);
+      }
+    };
+    walk(sections);
+  }
+
+  let html = '<div class="statute-doc">';
+
+  // Title block
+  html += `<div class="statute-title-block">
+    <h2>${escapeHtml(d.statute_name || 'Untitled Statute')}</h2>
+    ${d.structure?.citation ? `<div class="statute-citation">${escapeHtml(d.structure.citation)}</div>` : ''}
+    ${d.effective_date ? `<div class="statute-effective">Effective ${escapeHtml(d.effective_date)}</div>` : ''}
+  </div>`;
+
+  // Legislative intent
+  if (intent) {
+    html += '<div class="statute-intent">';
+    html += '<h3>Legislative Intent</h3>';
+    if (intent.purpose) html += `<p>${escapeHtml(intent.purpose)}</p>`;
+    if (intent.findings && intent.findings.length) {
+      html += '<ul>' + intent.findings.map(f => `<li>${escapeHtml(f)}</li>`).join('') + '</ul>';
+    }
+    html += '</div>';
+  }
+
+  if (!sections || !sections.length) {
+    // No structure — render definitions then group reqs by source_section
+    html += renderDefinitionsBlock(defs, null);
+    if (!reqs.length) {
+      html += '<p style="color:var(--ink-faint);text-align:center;padding:30px;font-style:italic">No statute text available for reconstruction.</p>';
+    } else {
+      const grouped = {};
+      for (const r of reqs) {
+        const key = r.source_section || '(Unknown)';
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(r);
+      }
+      for (const key of Object.keys(grouped).sort()) {
+        const grpReqs = grouped[key];
+        html += `<div class="statute-sec">
+          <div class="statute-sec-heading"><span class="sec-id">\u00a7 ${escapeHtml(key)}</span></div>
+          <div class="statute-sec-content">
+            <div class="statute-sec-main"></div>
+            <div class="statute-sec-margin">${grpReqs.map(r => renderReqAnnotation(r)).join('')}</div>
+          </div>
+        </div>`;
+      }
+    }
+    html += '</div>';
+    panel.innerHTML = html;
+    return;
+  }
+
+  // Render sections recursively, inserting definitions at the definitions section
+  const matched = new Set();
+  let defsRendered = false;
+
+  function renderSec(sec, depth) {
+    const secNorm = normalizeSectionId(sec.id);
+    if (secNorm) matched.add(secNorm);
+    const sectionReqs = reqsBySection[secNorm] || [];
+    const title = sec.title || sec.id || '(untitled)';
+    const isDef = sec.section_type === 'definitions';
+    const isSubsec = depth > 0;
+    const wrapClass = isSubsec ? 'statute-subsec' : 'statute-sec';
+
+    let s = `<div class="${wrapClass}">`;
+    s += `<div class="statute-sec-heading">`;
+    if (sec.id) s += `<span class="sec-id">\u00a7 ${escapeHtml(sec.id)}</span> \u2014 `;
+    s += escapeHtml(title);
+    if (sec.section_type) s += `<span class="sec-type">${escapeHtml(sec.section_type)}</span>`;
+    s += '</div>';
+
+    // Two-column: main body left, annotations right
+    const hasAnnotations = sectionReqs.length > 0;
+    s += `<div class="statute-sec-content${hasAnnotations ? '' : ' no-annotations'}">`;
+    s += '<div class="statute-sec-main">';
+
+    // Definitions block: insert parsed definitions here
+    if (isDef && !defsRendered) {
+      defsRendered = true;
+      s += renderDefinitionsBlock(defs, sec.content);
+    } else {
+      // Reconstruct body from requirement cited text (authoritative),
+      // falling back to section content when no citations exist.
+      const quotes = sectionReqs
+        .map(r => r.citation?.quoted_text)
+        .filter(Boolean);
+
+      if (quotes.length) {
+        for (const q of quotes) {
+          s += `<div class="statute-body">${formatStatuteText(q)}</div>`;
+        }
+      } else if (sec.content) {
+        s += `<div class="statute-body">${formatStatuteText(sec.content)}</div>`;
+      }
+    }
+
+    // Recurse into subsections inside the main column
+    if (sec.subsections && sec.subsections.length) {
+      for (const sub of sec.subsections) {
+        s += renderSec(sub, depth + 1);
+      }
+    }
+
+    s += '</div>'; // .statute-sec-main
+
+    // Margin annotations
+    if (hasAnnotations) {
+      s += '<div class="statute-sec-margin">';
+      for (const r of sectionReqs) {
+        s += renderReqAnnotation(r);
+      }
+      s += '</div>';
+    }
+
+    s += '</div>'; // .statute-sec-content
+    s += '</div>';
+    return s;
+  }
+
+  for (const sec of sections) {
+    html += renderSec(sec, 0);
+  }
+
+  // If definitions were never placed into a section, render them before orphans
+  if (!defsRendered && Object.keys(defs).length) {
+    html += renderDefinitionsBlock(defs, null);
+  }
+
+  // Orphan requirements not matched to any structure section
+  const orphanKeys = Object.keys(reqsBySection).filter(k => !matched.has(k));
+  if (orphanKeys.length) {
+    html += '<div class="statute-orphan-header">Other Provisions</div>';
+    for (const key of orphanKeys.sort()) {
+      html += `<div class="statute-sec">
+        <div class="statute-sec-heading"><span class="sec-id">\u00a7 ${escapeHtml(key)}</span></div>
+        <div class="statute-sec-content">
+          <div class="statute-sec-main"></div>
+          <div class="statute-sec-margin">${reqsBySection[key].map(r => renderReqAnnotation(r)).join('')}</div>
+        </div>
+      </div>`;
+    }
+  }
+
+  html += '</div>';
+  panel.innerHTML = html;
+}
+
+function renderDefinitionsBlock(defs, rawContent) {
+  const entries = Object.entries(defs).sort((a, b) => {
+    const ta = (a[1].term || a[0]).toLowerCase();
+    const tb = (b[1].term || b[0]).toLowerCase();
+    return ta.localeCompare(tb);
+  });
+  if (!entries.length) {
+    // Fall back to raw content if no parsed definitions
+    if (rawContent) return `<div class="statute-body">${escapeHtml(rawContent)}</div>`;
+    return '';
+  }
+  let html = '<div class="statute-defs">';
+  html += entries.map(([key, d]) => {
+    const term = d.term || key;
+    return `<div class="statute-def-entry">
+      <span class="def-term-inline">\u201c${escapeHtml(term)}\u201d</span> means ${escapeHtml(d.definition)}${d.section ? `<span class="def-section-ref">(${escapeHtml(d.section)})</span>` : ''}
+    </div>`;
+  }).join('');
+  html += '</div>';
+  return html;
+}
+
+function renderReqAnnotation(r) {
+  const cat = catClass(r.category);
+  return `<div class="statute-req border-${cat}">
+    <div class="statute-req-desc">${escapeHtml(r.description)}</div>
+    <div class="statute-req-meta">
+      <span class="badge cat-${cat}" style="font-size:10px;padding:0 5px">${CAT_NAMES[cat] || cat}</span>
+      <span class="verified-icon" title="${r.verified ? 'Verified' : 'Unverified'}">${r.verified ? '&#10003;' : '&#9888;'}</span>
+    </div>
+  </div>`;
+}
+
+function collectTreePaths(sections, parentPath, set) {
+  sections.forEach((s, i) => {
+    const path = parentPath + '/' + i;
+    if (s.subsections && s.subsections.length) {
+      set.add(path);
+      collectTreePaths(s.subsections, path, set);
+    }
+  });
+}
+
+// ── Unverified Tab ──
+function renderUnverified() {
+  const items = appState.data.unverified_items || [];
+  if (!items.length) {
+    document.getElementById('panel-unverified').innerHTML = '<p style="color:var(--ink-faint);text-align:center;padding:30px;font-style:italic">All items verified successfully.</p>';
+    return;
+  }
+
+  document.getElementById('panel-unverified').innerHTML = items.map(item => {
+    const c = item.citation || {};
+    return `<div class="card error-card">
+      <div style="font-size:15px;color:var(--ink);font-weight:500;margin-bottom:4px">${escapeHtml(item.description)}</div>
+      ${c.section ? `<div style="font-size:14px;color:var(--ink-faint);margin-bottom:4px;font-style:italic">${escapeHtml(c.section)}</div>` : ''}
+      ${c.quoted_text ? `<blockquote>${escapeHtml(c.quoted_text)}</blockquote>` : ''}
+      ${item.error ? `<div class="error-msg">${escapeHtml(item.error)}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ── Event Delegation ──
+
+document.getElementById('panel-requirements').addEventListener('click', e => {
+  const header = e.target.closest('.card-header');
+  if (!header) return;
+  const card = header.closest('.card');
+  const id = card.dataset.reqId;
+  if (appState.expandedReqs.has(id)) appState.expandedReqs.delete(id);
+  else appState.expandedReqs.add(id);
+  const arrow = header.querySelector('.arrow');
+  const body = card.querySelector('.card-body');
+  arrow.classList.toggle('open');
+  body.classList.toggle('open');
+});
+
+document.getElementById('panel-structure').addEventListener('click', e => {
+  const item = e.target.closest('.tree-item');
+  if (!item) {
+    if (e.target.id === 'expandAllBtn') {
+      const sections = appState.data.structure?.sections;
+      if (sections) collectTreePaths(sections, 'root', appState.expandedTree);
+      renderStructure();
+    } else if (e.target.id === 'collapseAllBtn') {
+      appState.expandedTree.clear();
+      renderStructure();
+    }
+    return;
+  }
+  const path = item.dataset.treePath;
+  const children = item.parentElement.querySelector('.tree-children');
+  if (!children) return;
+  if (appState.expandedTree.has(path)) appState.expandedTree.delete(path);
+  else appState.expandedTree.add(path);
+  item.querySelector('.arrow').classList.toggle('open');
+  children.classList.toggle('open');
+});
+
+document.getElementById('tabBar').addEventListener('click', e => {
+  const btn = e.target.closest('.tab-btn');
+  if (!btn) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
+});
+
+document.getElementById('catToggles').addEventListener('click', e => {
+  const toggle = e.target.closest('.cat-toggle');
+  if (!toggle) return;
+  const cat = toggle.dataset.cat;
+  if (appState.filters.categories.has(cat)) appState.filters.categories.delete(cat);
+  else appState.filters.categories.add(cat);
+  renderCatToggles();
+  renderRequirements();
+});
+
+document.getElementById('verifiedBtns').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  appState.filters.verified = btn.dataset.val;
+  renderVerifiedBtns();
+  renderRequirements();
+});
+
+document.getElementById('searchInput').addEventListener('input', debounce(() => {
+  appState.filters.search = document.getElementById('searchInput').value;
+  renderRequirements();
+}, 300));
+
+document.getElementById('confSlider').addEventListener('input', e => {
+  appState.filters.confidence = parseInt(e.target.value);
+  document.getElementById('confValue').textContent = e.target.value + '%';
+  renderRequirements();
+});
+
+</script>
+</body>
+</html>

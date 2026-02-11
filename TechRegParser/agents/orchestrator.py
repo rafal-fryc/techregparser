@@ -1,6 +1,7 @@
 """Main orchestrator agent for the TechRegParser system."""
 
 import asyncio
+import hashlib
 import json
 import re
 import tempfile
@@ -21,6 +22,7 @@ from ..models import (
     AnalysisResult,
     StatuteStructure,
     Definition,
+    LegislativeIntent,
     Requirement,
     Citation,
     RequirementCategory,
@@ -146,6 +148,60 @@ class TechRegParserOrchestrator:
         except IOError:
             pass
 
+    def _get_structure_cache_path(self, statute_path: str) -> Path:
+        """Get the cache file path for a statute's Phase 1 structure.
+
+        The cache key is based on the file content hash, so re-runs of the
+        same statute file will hit cache even if the path changes.
+
+        Args:
+            statute_path: Path to the statute file
+
+        Returns:
+            Path to the cache file
+        """
+        content_hash = hashlib.md5(Path(statute_path).read_bytes()).hexdigest()[:12]
+        cache_dir = Path(self.config.working_directory) / ".techregparser_cache"
+        cache_dir.mkdir(exist_ok=True)
+        return cache_dir / f"{content_hash}_structure.json"
+
+    def _load_cached_structure(self, statute_path: str) -> Optional[StatuteStructure]:
+        """Load Phase 1 structure from cache if available.
+
+        Args:
+            statute_path: Path to the statute file
+
+        Returns:
+            Cached StatuteStructure, or None if no cache hit
+        """
+        if not self.config.use_cache:
+            return None
+        cache_path = self._get_structure_cache_path(statute_path)
+        if not cache_path.exists():
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return StatuteStructure.from_dict(data)
+        except (json.JSONDecodeError, IOError, KeyError):
+            return None
+
+    def _save_structure_cache(self, statute_path: str, structure: StatuteStructure) -> None:
+        """Save Phase 1 structure to cache for future re-runs.
+
+        Args:
+            statute_path: Path to the statute file
+            structure: The parsed statute structure to cache
+        """
+        if not self.config.use_cache:
+            return
+        cache_path = self._get_structure_cache_path(statute_path)
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(structure.to_dict(), f, indent=2)
+        except (IOError, TypeError):
+            pass
+
     def _build_memory_context(self) -> str:
         """Build context string from session memory for injection into prompts.
 
@@ -168,11 +224,9 @@ class TechRegParserOrchestrator:
                 pct = count / total * 100 if total > 0 else 0
                 lines.append(f"    {cat}: {pct:.0f}%")
 
-        # Show last run's defined terms as hints
-        last_run = runs[-1]
-        terms = last_run.get("defined_terms", [])
-        if terms:
-            lines.append(f"  Terms from last statute: {', '.join(terms[:15])}")
+        # Note: defined_terms from previous runs are intentionally excluded
+        # here to avoid cross-statute contamination (e.g., Minnesota terms
+        # leaking into a Nebraska run when Phase 1 fails).
 
         return "\n".join(lines) + "\n"
 
@@ -195,6 +249,7 @@ class TechRegParserOrchestrator:
             setting_sources=["project"],
             cwd=self.config.working_directory,
             permission_mode="bypassPermissions",
+            max_buffer_size=20 * 1024 * 1024,  # 20 MB for large PDF statutes
         )
 
     def _get_orchestrator_options(self) -> ClaudeAgentOptions:
@@ -209,6 +264,7 @@ class TechRegParserOrchestrator:
             permission_mode="bypassPermissions",
             cwd=self.config.working_directory,
             model=self.config.model,
+            max_buffer_size=20 * 1024 * 1024,  # 20 MB for large PDF statutes
         )
 
     async def analyze_statute(
@@ -237,24 +293,116 @@ class TechRegParserOrchestrator:
             if self._memory.get("runs"):
                 print(f"Session memory: loaded patterns from {len(self._memory['runs'])} previous run(s)")
 
-        # Phase 1: Structure Analysis
-        print(f"Phase 1: Analyzing statute structure...")
-        structure = await self._run_with_retry(
-            self._analyze_structure, statute_text, statute_path
-        )
+        # Phase 1: Structure Analysis (with optional caching)
+        cached_structure = self._load_cached_structure(statute_path)
+        if cached_structure is not None:
+            print(f"Phase 1: Loaded structure from cache (skipping LLM call)")
+            structure = cached_structure
+            print(f"  Found {len(structure.sections)} sections, {len(structure.definitions)} definitions")
+        else:
+            print(f"Phase 1: Analyzing statute structure...")
+            structure = await self._run_with_retry(
+                self._analyze_structure, statute_text, statute_path
+            )
+            if structure is None:
+                print("  WARNING: Phase 1 returned no structure. Definitions, section types,")
+                print("           and structure tree will be missing from output.")
+                print("           Phase 2 will proceed without section context.")
+            elif structure.sections:
+                print(f"  Found {len(structure.sections)} sections, {len(structure.definitions)} definitions")
+                self._save_structure_cache(statute_path, structure)
 
         # Phase 2: Extract Requirements
         print(f"Phase 2: Extracting requirements...")
-        requirements = await self._run_with_retry(
-            self._extract_requirements, statute_text, structure, statute_path, resume
-        )
+        last_error = None
+        output_file = None
+        for attempt in range(DEFAULT_MAX_RETRIES):
+            try:
+                requirements, output_file = await self._extract_requirements(
+                    statute_text, structure, statute_path,
+                    resume=(resume or attempt > 0),  # Auto-resume on retry
+                )
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < DEFAULT_MAX_RETRIES - 1:
+                    delay = DEFAULT_RETRY_BASE_DELAY * (2 ** attempt)
+                    print(f"  Retry {attempt + 1}/{DEFAULT_MAX_RETRIES - 1} after error: {e}")
+                    print(f"  Waiting {delay:.0f}s before retry...")
+                    await asyncio.sleep(delay)
+                else:
+                    raise last_error
 
         # Build extraction metadata for Phase 3/4 context
         extraction_meta = self._build_extraction_metadata(requirements, structure)
 
-        # Phase 3 & 4: Verify Citations and Classify Requirements (in parallel if both enabled)
+        # Determine if backfill is needed
+        needs_backfill = False
+        if structure and structure.sections:
+            skip_types = {"definitions", "preamble", "legislative_intent"}
+            expected = {s.id for s in structure.sections if s.section_type.value not in skip_types}
+            covered = set()
+            for req in requirements:
+                norm = self._normalize_section_id(req.source_section)
+                for exp_id in expected:
+                    if self._normalize_section_id(exp_id) == norm:
+                        covered.add(exp_id)
+            missed = expected - covered
+            needs_backfill = len(missed) >= 3 and len(missed) >= 0.2 * len(expected)
+
+        # Early Phase 4: Start classification on initial requirements while backfill runs
+        classification_task = None
+        initial_req_ids = {req.id for req in requirements}
+        if self.config.classify_requirements and needs_backfill:
+            print(f"Phase 4: Starting early classification (overlapping with backfill)...")
+            classification_task = asyncio.create_task(
+                self._run_with_retry(
+                    self._classify_requirements, requirements, extraction_meta
+                )
+            )
+
+        # Backfill missed sections (if needed)
+        if needs_backfill and output_file:
+            requirements = await self._check_completeness_and_backfill(
+                requirements, structure, statute_path, output_file,
+            )
+            # Re-apply caps after backfill
+            requirements = self._enforce_section_caps(requirements, structure)
+
+        # Clean up output file
+        if output_file and output_file.exists():
+            output_file.unlink()
+
+        # Phase 3 & 4: Verify Citations and Classify Requirements
         unverified = []
-        if self.config.verify_citations and self.config.classify_requirements:
+
+        if classification_task is not None:
+            # Early classification was started — await it and handle backfill additions
+            category_map = await classification_task
+
+            # Classify any new requirements added by backfill
+            new_reqs = [r for r in requirements if r.id not in initial_req_ids]
+            if new_reqs:
+                print(f"  Classifying {len(new_reqs)} new requirements from backfill...")
+                new_meta = self._build_extraction_metadata(new_reqs, structure)
+                supplementary_map = await self._run_with_retry(
+                    self._classify_requirements, new_reqs, new_meta
+                )
+                category_map.update(supplementary_map)
+
+            # Apply categories
+            for req in requirements:
+                if req.id in category_map:
+                    req.category = category_map[req.id]
+
+            # Run Phase 3 verification
+            if self.config.verify_citations:
+                print(f"Phase 3: Verifying citations...")
+                requirements, unverified = await self._run_with_retry(
+                    self._verify_citations, requirements, statute_text
+                )
+        elif self.config.verify_citations and self.config.classify_requirements:
+            # No backfill needed — run Phase 3 and 4 in parallel as before
             print(f"Phase 3+4: Verifying citations and classifying requirements (parallel)...")
             (requirements, unverified), category_map = await asyncio.gather(
                 self._run_with_retry(
@@ -264,7 +412,6 @@ class TechRegParserOrchestrator:
                     self._classify_requirements, requirements, extraction_meta
                 ),
             )
-            # Apply categories from parallel classification using ID-based mapping
             for req in requirements:
                 if req.id in category_map:
                     req.category = category_map[req.id]
@@ -282,6 +429,9 @@ class TechRegParserOrchestrator:
                 if req.id in category_map:
                     req.category = category_map[req.id]
 
+        # Rebuild extraction metadata with final requirement list
+        final_extraction_meta = self._build_extraction_metadata(requirements, structure)
+
         # Build result
         result = AnalysisResult(
             statute_name=statute_name,
@@ -289,13 +439,14 @@ class TechRegParserOrchestrator:
             definitions=structure.definitions if structure else {},
             requirements=requirements,
             structure=structure,
+            legislative_intent=structure.legislative_intent if structure else None,
             unverified_items=unverified,
             metadata={
                 "source_file": statute_path,
                 "total_requirements": len(requirements),
                 "verified_count": len([r for r in requirements if r.verified]),
                 "output_format": output_format,
-                **extraction_meta,
+                **final_extraction_meta,
             },
         )
 
@@ -365,6 +516,7 @@ class TechRegParserOrchestrator:
                         text_parts.append(f"--- Page {page_num} ---\n{page_text}")
 
             if text_parts:
+                print(f"  PDF parsed with pdfplumber ({len(pdf.pages)} pages)")
                 return "\n\n".join(text_parts)
 
         except ImportError:
@@ -383,6 +535,7 @@ class TechRegParserOrchestrator:
                     text_parts.append(f"--- Page {page_num} ---\n{page_text}")
 
             if text_parts:
+                print(f"  PDF parsed with pypdf ({len(reader.pages)} pages)")
                 return "\n\n".join(text_parts)
 
         except ImportError:
@@ -409,14 +562,16 @@ class TechRegParserOrchestrator:
         Returns:
             StatuteStructure with parsed sections and definitions
         """
-        # For large statutes, write to a temp file and let the agent Read on demand
-        # instead of embedding the full text in the prompt
-        statute_len = len(statute_text)
-        use_file_context = statute_len > 50000
+        # Write statute text to a temp file so the agent reads the same text
+        # that Phase 3 (citation verifier) will verify against.
+        output_dir = Path(self.config.working_directory)
+        statute_hash = hashlib.md5(statute_path.encode()).hexdigest()[:8]
+        statute_text_file = output_dir / f".techregparser_statute_{statute_hash}.txt"
+        statute_text_file.write_text(statute_text, encoding="utf-8")
 
         prompt = f"""Analyze the structure of this statute.
 
-The statute is located at: {statute_path}
+The statute text has been extracted and saved to: {statute_text_file.absolute()}
 
 Please:
 1. Use the Read tool to access the statute text at the path above
@@ -429,16 +584,21 @@ Return your analysis as a JSON object with:
 - citation: official citation if found
 - effective_date: effective date if found
 - sections: list of section objects, each with:
-  - id: section identifier
+  - id: the section number exactly as it appears in the statute text headings and cross-references. Use the statute's own internal numbering, not any external code or title numbering. For example, if the statute text says "Section 5" or "§ 5", use "5"; if it says "§ 12.3-101", use "12.3-101".
   - title: section title
-  - section_type: one of (definitions, applicability, consumer_rights, controller_duties, processor_duties, exemptions, enforcement, general, preamble, other)
+  - section_type: one of (definitions, applicability, consumer_rights, controller_duties, processor_duties, exemptions, enforcement, general, preamble, legislative_intent, other)
   - content: first 200 characters of section content (preview)
   - start_line: starting line number
   - end_line: ending line number
 - definitions: dictionary where each key is the defined term and each value is an object with:
   - term: the defined term
   - definition: the exact statutory definition text
-  - section: the section number where this definition appears (e.g., "22601")
+  - section: the section number where this definition appears
+- legislative_intent: (optional, include only if the statute has purpose/findings/intent sections) an object with:
+  - purpose: the stated purpose or policy goal (plain text summary)
+  - findings: list of individual legislative findings (each as a string)
+  - source_sections: list of section IDs where intent was found
+  - raw_text: the original text of the intent/purpose/findings sections
 
 {STATUTORY_INTERPRETATION_PRINCIPLES}
 """
@@ -458,8 +618,14 @@ Return your analysis as a JSON object with:
                     json_match = self._extract_json(result_text)
                     if json_match:
                         structure_data = json.loads(json_match)
-                except (json.JSONDecodeError, ValueError):
-                    pass
+                    else:
+                        print(f"  Phase 1: No JSON found in agent response ({len(result_text)} chars)")
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"  Phase 1: JSON parse error: {e}")
+
+        # Clean up statute text temp file
+        if statute_text_file.exists():
+            statute_text_file.unlink()
 
         if structure_data:
             return StatuteStructure.from_dict(structure_data)
@@ -472,7 +638,7 @@ Return your analysis as a JSON object with:
         structure: Optional[StatuteStructure],
         statute_path: str,
         resume: bool = False,
-    ) -> list[Requirement]:
+    ) -> tuple[list[Requirement], Path]:
         """Use the section-analyzer subagent to extract requirements.
 
         The agent writes requirements incrementally to a JSONL file as it
@@ -485,11 +651,13 @@ Return your analysis as a JSON object with:
             resume: If True, resume from existing partial output
 
         Returns:
-            List of extracted requirements
+            Tuple of (extracted requirements, output file path for backfill)
         """
         # Create a temp file for the agent to write results into
+        # Use statute-specific hash to prevent collisions during parallel runs
         output_dir = Path(self.config.working_directory)
-        output_file = output_dir / ".techregparser_requirements.jsonl"
+        statute_hash = hashlib.md5(statute_path.encode()).hexdigest()[:8]
+        output_file = output_dir / f".techregparser_requirements_{statute_hash}.jsonl"
 
         # P6a: Checkpoint/resume support
         already_processed_sections = set()
@@ -501,51 +669,92 @@ Return your analysis as a JSON object with:
             if already_processed_sections:
                 print(f"  Resuming: {len(existing_reqs)} requirements from {len(already_processed_sections)} sections already processed")
 
-        prompt = f"""Extract legal requirements from this statute.
+        # Write statute text to a temp file so the agent reads the same text
+        # that Phase 3 (citation verifier) will verify against.
+        statute_text_file = output_dir / f".techregparser_statute_{statute_hash}.txt"
+        statute_text_file.write_text(statute_text, encoding="utf-8")
 
-The statute is located at: {statute_path}
-Use the Read tool to access the statute text. Work section by section.
+        prompt = f"""Extract legal requirements AND legal framework provisions from this statute.
+
+The statute text has been extracted and saved to: {statute_text_file.absolute()}
+Use the Read tool to access the statute text at that path. Work section by section.
 
 IMPORTANT - INCREMENTAL OUTPUT:
-As you finish extracting requirements from each section, immediately write them
-to the output file using the Write tool. Do NOT accumulate all requirements in
-your response.
+As you finish extracting items from each section, immediately save them
+to the output file. Do NOT accumulate all items in your response.
 
 Output file: {output_file}
 
-Write one JSON object per line (JSONL format). Each line should be a complete
-requirement object. Append to the file — do not overwrite previous lines.
+Format: One JSON object per line (JSONL format). Each line is a complete item.
 
-Each requirement JSON object must contain:
+CRITICAL APPEND PROCEDURE (the Write tool OVERWRITES, it does not append):
+1. FIRST: Read the current contents of the output file using the Read tool
+2. THEN: Write the OLD contents PLUS your new JSON lines using the Write tool
+This ensures previous items are preserved. Never write only new lines.
+If the file doesn't exist yet or is empty, just write your new lines.
+
+Each JSON object must contain:
 - description: human-readable description
 - citation: {{ "section": "...", "quoted_text": "..." }}
 - applies_to: who it applies to
 - conditions: list of conditions
-- category: disclosure/operational/technical/enforcement
-- source_section: the section ID this requirement came from
+- category: one of the following (see definitions below)
+- source_section: the section ID this item came from
+- obligation_type: "shall" | "shall_not" | "may" | "must" | "may_not" (the verb form)
 
-CRITICAL: Every requirement MUST have a direct quote from the statute.
+Categories:
+- disclosure: Must appear in privacy policy/notice text (data categories, purposes,
+  rights, third parties, retention, contact info)
+- operational: Internal compliance processes (response deadlines, free request limits,
+  appeal timelines, consent revocation processing, assessment requirements)
+- technical: System/UI implementation (GPC signals, security measures, opt-out buttons,
+  age verification, dark pattern prohibitions, link placements)
+- legal_framework: Applicability thresholds, entity/data exemptions, scope rules,
+  penalties, AG authority, cure periods, private right of action provisions
+
+CRITICAL: Every item MUST have a direct quote from the statute.
+
+WHAT TO EXTRACT:
+1. REQUIREMENTS (category: disclosure/operational/technical) — affirmative
+   obligations, duties, and mandates imposed on covered entities.
+2. LEGAL FRAMEWORK PROVISIONS (category: legal_framework) — these are NOT
+   optional. You MUST extract from EVERY section typed as applicability,
+   exemptions, scope, or enforcement. Specifically:
+   - APPLICABILITY: Who the statute applies to, threshold criteria, scope
+   - EXEMPTIONS: Entity-level exemptions (e.g., nonprofits, government,
+     HIPAA-covered entities) and data-level exemptions (e.g., employee data,
+     publicly available info, de-identified data). Consolidate each exemption
+     section into one item with the full list in quoted_text.
+   - ENFORCEMENT: Penalties, AG authority, cure periods, private right of action
+     (or lack thereof)
 
 CONSOLIDATION RULES:
 - When a statute lists multiple items under a single subsection (e.g., "may not
-  do any of the following: (1)... (2)... (3)..."), extract ONE requirement that
-  covers the entire list, not separate requirements per sub-item.
+  do any of the following: (1)... (2)... (3)..."), extract ONE item that
+  covers the entire list, not separate items per sub-item.
 - For the quoted_text field: quote the parent clause plus the full enumerated
   list. If the list is very long, quote the parent clause and a representative
   excerpt with "..." to indicate continuation.
 - Skip cross-references: if a section says "must comply with Section X" and you
-  already extracted Section X's requirements, do NOT create a separate
-  requirement for the cross-reference.
-- Aim for roughly one requirement per statutory subsection, not one per
-  sub-clause.
-- Target: 8-15 requirements for a typical statute. If you have 25+, you are
-  likely too granular — look for opportunities to group related items.
+  already extracted Section X's content, do NOT create a separate item for the
+  cross-reference.
+- Aim for roughly one item per statutory subsection, not one per sub-clause.
+
+COVERAGE IS MANDATORY:
+- Every substantive section MUST produce at least one item. Do NOT skip any section.
+- HARD CAP: Maximum 5 items per section. If a section has more than 5 subsections,
+  consolidate related subsections into fewer items. Example: group all "controller
+  data handling duties" from subsections (a)-(g) into 1-2 items, rather than one
+  per subsection.
+- Full coverage across all sections is more important than depth in any one section.
 
 After processing all sections, write the string "DONE" as the final line of the
 output file to signal completion.
 """
 
         # P5a: Richer Phase 1 to Phase 2 handoff
+        # Write context to a temp file to avoid Windows command-line length limits (8191 chars)
+        # Large statutes like Delaware/Indiana can have 8-12KB of definitions and section metadata
         if structure:
             definitions_context = {}
             for k, v in structure.definitions.items():
@@ -560,25 +769,56 @@ output file to signal completion.
                     "id": s.id,
                     "title": s.title,
                     "section_type": s.section_type.value,
-                    "content_preview": s.content[:200] if s.content else "",
+                    "content_preview": s.content[:500] if s.content else "",
                     "start_line": s.start_line,
                     "end_line": s.end_line,
                 }
                 sections_context.append(section_info)
 
-            structure_summary = json.dumps({
+            # Write Phase 1 context to a file instead of embedding in prompt
+            context_file = output_dir / f".phase1_context_{statute_hash}.json"
+            context_data = {
                 "definitions": definitions_context,
                 "sections": sections_context,
-            }, indent=2)
-            prompt += f"\n\nPHASE 1 ANALYSIS (definitions and structure already extracted):\n{structure_summary}\n"
+            }
+            if structure.legislative_intent:
+                context_data["legislative_intent"] = structure.legislative_intent.to_dict()
+            context_file.write_text(json.dumps(context_data, indent=2), encoding="utf-8")
 
-            # P4: Inject definitions for the section-analyzer to reference
-            if structure.definitions:
-                def_text = "\n".join(
-                    f'  - "{k}": {v.definition}'
-                    for k, v in structure.definitions.items()
-                )
-                prompt += f"\n\nSTATUTORY DEFINITIONS (use these for consistent interpretation):\n{def_text}\n"
+            prompt += f"\n\nPHASE 1 ANALYSIS: The definitions and structure have been extracted."
+            prompt += f"\nRead the context file at: {context_file.absolute()}"
+            prompt += "\nUse the Read tool to load this JSON file before processing sections."
+            prompt += "\nThe file contains 'definitions' (term -> text/section), 'sections' (id, title, type, preview), and optionally 'legislative_intent' (purpose, findings) for interpretive context."
+
+            prompt += """
+
+SECTION IDs: Use the section IDs from the Phase 1 context as your starting reference.
+However, VERIFY them against the actual statute text. If the statute headings and
+cross-references use different section numbers than Phase 1 provided, use the numbers
+from the statute text. The citation.section field must always match what appears in the
+statute. Do NOT invent section numbers that appear in neither Phase 1 nor the statute text.
+
+Use the section_type field to guide extraction:
+- "definitions": Skip (already extracted in Phase 1)
+- "applicability": MUST extract as legal_framework (who must comply, thresholds)
+- "exemptions": MUST extract as legal_framework (entity and data exemptions)
+- "enforcement": MUST extract as legal_framework (penalties, AG authority, cure periods)
+- "consumer_rights": Extract as operational (rights to exercise) or disclosure (rights to disclose)
+- "controller_duties" / "processor_duties": Extract as operational, technical, or disclosure
+- "preamble" / "legislative_intent": Skip (used as interpretive context only)
+- "general" / "other": Extract if substantive content exists
+"""
+
+            # Add explicit section checklist to reduce backfill triggers
+            if structure.sections:
+                checklist = []
+                for s in structure.sections:
+                    if s.section_type.value not in ("definitions", "preamble", "legislative_intent"):
+                        checklist.append(f"  [ ] Section {s.id}: {s.title}")
+                if checklist:
+                    prompt += "\nSECTION CHECKLIST — extract from every section below:\n"
+                    prompt += "\n".join(checklist)
+                    prompt += "\nMark each section done as you process it. Do NOT stop until all are done.\n"
 
         # P6a: Tell agent which sections to skip if resuming
         if already_processed_sections:
@@ -610,9 +850,316 @@ output file to signal completion.
         # Read requirements from the JSONL output file
         requirements = self._read_requirements_file(output_file)
 
-        # Clean up
-        if output_file.exists():
-            output_file.unlink()
+        if not requirements:
+            print("  Warning: No requirements parsed from output file. "
+                  "The section-analyzer may have overwritten earlier results.")
+
+        # Fix 1: Enforce per-section hard cap
+        requirements = self._enforce_section_caps(requirements, structure)
+
+        # Clean up context file and statute text file (output_file kept for potential backfill)
+        context_cleanup = output_dir / f".phase1_context_{statute_hash}.json"
+        if context_cleanup.exists():
+            context_cleanup.unlink()
+        if statute_text_file.exists():
+            statute_text_file.unlink()
+
+        return requirements, output_file
+
+    @staticmethod
+    def _normalize_section_id(section_id: str) -> str:
+        """Normalize a section ID to its top-level root for grouping.
+
+        Strips prefixes like 'Section '/'Sec. ', subdivision suffixes,
+        and trailing parenthesized content to get the root section number.
+
+        Examples:
+            '325O.05, Subd. 1(a)' -> '325O.05'
+            '541.002(a)' -> '541.002'
+            '9(6)' -> '9'
+            'RSA 507-H:3(I)(a)' -> 'RSA 507-H:3'
+            'Section 5' -> '5'
+        """
+        s = section_id.strip()
+        # Strip common prefixes
+        for prefix in ["Section ", "Sec. ", "§ ", "§"]:
+            if s.startswith(prefix):
+                s = s[len(prefix):].strip()
+        # Split on subdivision markers and take the left part
+        for marker in [", Subd.", ", Subdivision", ",Subd.", ",Subdivision"]:
+            if marker.lower() in s.lower():
+                idx = s.lower().index(marker.lower())
+                s = s[:idx].strip()
+        # Strip trailing parenthesized content: extract root up to first '('
+        paren_match = re.match(r'^([^(]+)', s)
+        if paren_match:
+            s = paren_match.group(1).strip()
+        return s
+
+    def _enforce_section_caps(
+        self,
+        requirements: list[Requirement],
+        structure: Optional[StatuteStructure],
+        max_per_section: int = 5,
+    ) -> list[Requirement]:
+        """Enforce a hard cap on requirements per top-level section.
+
+        Groups requirements by normalized section ID and keeps only the
+        best N per group, scoring by quote length and obligation strength.
+
+        Args:
+            requirements: All extracted requirements
+            structure: Parsed statute structure (for exact-match scoring)
+            max_per_section: Maximum requirements per top-level section
+
+        Returns:
+            Capped list of requirements preserving original order
+        """
+        if not requirements:
+            return requirements
+
+        # Build set of Phase 1 section IDs for exact-match bonus
+        phase1_ids = set()
+        if structure and structure.sections:
+            phase1_ids = {s.id for s in structure.sections}
+
+        # Group by normalized section ID
+        from collections import defaultdict
+        groups: dict[str, list[int]] = defaultdict(list)
+        for idx, req in enumerate(requirements):
+            norm = self._normalize_section_id(req.source_section)
+            groups[norm].append(idx)
+
+        # Identify which indices to keep
+        keep_indices: set[int] = set()
+        for norm_id, indices in groups.items():
+            if len(indices) <= max_per_section:
+                keep_indices.update(indices)
+                continue
+
+            # Score each requirement in the group
+            scored = []
+            for idx in indices:
+                req = requirements[idx]
+                score = 0.0
+                # Prefer longer quoted_text (more comprehensive)
+                quote_len = len(req.citation.quoted_text) if req.citation.quoted_text else 0
+                score += min(quote_len / 200.0, 3.0)  # Cap at 3 points
+                # Prefer shall/must over may
+                obl = (req.obligation_type or "").lower()
+                if obl in ("shall", "must"):
+                    score += 2.0
+                elif obl in ("shall_not", "must_not"):
+                    score += 1.5
+                elif obl in ("may_not",):
+                    score += 1.0
+                # Prefer exact Phase 1 section match
+                if req.source_section in phase1_ids:
+                    score += 1.0
+                scored.append((score, idx))
+
+            # Sort by score descending, keep top N
+            scored.sort(key=lambda x: -x[0])
+            kept = [idx for _, idx in scored[:max_per_section]]
+            keep_indices.update(kept)
+
+            print(f"  Section cap: {norm_id} had {len(indices)} items, capped to {max_per_section}")
+
+        # Return in original order
+        return [req for idx, req in enumerate(requirements) if idx in keep_indices]
+
+    def _write_requirements_to_jsonl(
+        self,
+        requirements: list[Requirement],
+        output_file: Path,
+    ) -> None:
+        """Serialize current requirements back to JSONL for the resume mechanism.
+
+        Args:
+            requirements: List of requirements to write
+            output_file: Path to the JSONL output file
+        """
+        with open(output_file, "w", encoding="utf-8") as f:
+            for req in requirements:
+                data = {
+                    "description": req.description,
+                    "citation": {
+                        "section": req.citation.section,
+                        "quoted_text": req.citation.quoted_text,
+                        "context": req.citation.context,
+                    },
+                    "category": req.category.value,
+                    "applies_to": req.applies_to,
+                    "conditions": req.conditions,
+                    "source_section": req.source_section,
+                    "obligation_type": req.obligation_type,
+                }
+                f.write(json.dumps(data) + "\n")
+
+    async def _check_completeness_and_backfill(
+        self,
+        requirements: list[Requirement],
+        structure: StatuteStructure,
+        statute_path: str,
+        output_file: Path,
+        max_passes: int = 2,
+    ) -> list[Requirement]:
+        """Check for missed sections and run backfill passes to cover them.
+
+        Compares Phase 1 sections against extracted requirements and re-runs
+        the section-analyzer for any missed sections.
+
+        Args:
+            requirements: Currently extracted requirements
+            structure: Parsed statute structure from Phase 1
+            statute_path: Path to the statute file
+            output_file: Path to the JSONL output file
+            max_passes: Maximum number of backfill passes
+
+        Returns:
+            Updated list of requirements including backfilled items
+        """
+        # Skip types that don't produce requirements
+        skip_types = {"definitions", "preamble", "legislative_intent"}
+
+        # Build expected set from Phase 1 sections
+        expected: dict[str, "StatuteSection"] = {}
+        for section in structure.sections:
+            if section.section_type.value not in skip_types:
+                expected[section.id] = section
+
+        if not expected:
+            return requirements
+
+        # Build covered set from requirements
+        covered = set()
+        for req in requirements:
+            norm = self._normalize_section_id(req.source_section)
+            for exp_id in expected:
+                if self._normalize_section_id(exp_id) == norm:
+                    covered.add(exp_id)
+
+        missed = set(expected.keys()) - covered
+
+        # Trigger threshold: >= 3 missed AND >= 20% of expected
+        if len(missed) < 3 or len(missed) < 0.2 * len(expected):
+            if missed:
+                print(f"  Completeness check: {len(missed)} section(s) uncovered "
+                      f"(below backfill threshold of 3 and 20%)")
+            return requirements
+
+        print(f"  Completeness check: {len(missed)}/{len(expected)} sections uncovered, "
+              f"starting backfill...")
+
+        # Write statute text to a temp file so the backfill agent reads the same
+        # text that Phase 3 (citation verifier) will verify against.
+        output_dir = Path(self.config.working_directory)
+        statute_hash = hashlib.md5(statute_path.encode()).hexdigest()[:8]
+        statute_text_file = output_dir / f".techregparser_statute_{statute_hash}.txt"
+        # Only write if not already present (e.g. from _extract_requirements)
+        if not statute_text_file.exists():
+            statute_text = self._read_statute(statute_path)
+            statute_text_file.write_text(statute_text, encoding="utf-8")
+
+        for pass_num in range(1, max_passes + 1):
+            print(f"  Backfill pass {pass_num}/{max_passes}: targeting {len(missed)} sections")
+
+            # Write current requirements to JSONL for the agent to read
+            self._write_requirements_to_jsonl(requirements, output_file)
+
+            # Build focused prompt listing only missed sections
+            section_lines = []
+            for sec_id in sorted(missed):
+                sec = expected[sec_id]
+                line_range = f"lines {sec.start_line}-{sec.end_line}" if sec.start_line else "lines unknown"
+                section_lines.append(
+                    f"- Section {sec_id} ({sec.section_type.value}, {line_range}): \"{sec.title}\""
+                )
+            sections_listing = "\n".join(section_lines)
+
+            backfill_prompt = f"""You are completing an extraction that was interrupted.
+The statute text has been extracted and saved to: {statute_text_file.absolute()}
+Output file: {output_file}
+
+Read the output file FIRST using the Read tool, then APPEND new items.
+
+CRITICAL APPEND PROCEDURE (the Write tool OVERWRITES, it does not append):
+1. FIRST: Read the current contents of the output file using the Read tool
+2. THEN: Write the OLD contents PLUS your new JSON lines using the Write tool
+This ensures previous items are preserved. Never write only new lines.
+
+Extract from ONLY these sections:
+{sections_listing}
+
+Each JSON object (one per line) must contain:
+- description: human-readable description
+- citation: {{ "section": "...", "quoted_text": "..." }}
+- applies_to: who it applies to
+- conditions: list of conditions
+- category: one of (disclosure, operational, technical, legal_framework)
+- source_section: the section ID this item came from
+- obligation_type: "shall" | "shall_not" | "may" | "must" | "may_not"
+
+CONSOLIDATION RULES:
+- One item per statutory subsection, NOT one per sub-clause.
+- Maximum 5 items per section. Consolidate related provisions.
+- Every item MUST have a direct quote from the statute in quoted_text.
+
+Use the Read tool to access the statute text at {statute_text_file.absolute()}.
+Write "DONE" as the final line when finished.
+"""
+
+            options = self._get_subagent_options("section-analyzer")
+
+            # Run backfill agent
+            async for message in query(prompt=backfill_prompt, options=options):
+                pass
+
+            # Read updated requirements
+            new_requirements = self._read_requirements_file(output_file)
+
+            # Deduplicate by (normalized section, description prefix)
+            seen = set()
+            deduped = []
+            for req in new_requirements:
+                key = (
+                    self._normalize_section_id(req.source_section),
+                    req.description[:80].lower(),
+                )
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(req)
+            new_requirements = deduped
+
+            # Check new coverage
+            new_covered = set()
+            for req in new_requirements:
+                norm = self._normalize_section_id(req.source_section)
+                for exp_id in expected:
+                    if self._normalize_section_id(exp_id) == norm:
+                        new_covered.add(exp_id)
+
+            newly_filled = new_covered - covered
+            print(f"  Backfill pass {pass_num}: covered {len(newly_filled)} new section(s) "
+                  f"({len(new_requirements)} total requirements)")
+
+            if not newly_filled:
+                # No progress — stop to prevent infinite loops
+                print(f"  Backfill stopping: no new sections covered in pass {pass_num}")
+                break
+
+            requirements = new_requirements
+            covered = new_covered
+            missed = set(expected.keys()) - covered
+
+            if len(missed) < 3 or len(missed) < 0.2 * len(expected):
+                print(f"  Backfill complete: {len(missed)} section(s) remain uncovered "
+                      f"(below threshold)")
+                break
+
+        # Clean up statute text temp file
+        if statute_text_file.exists():
+            statute_text_file.unlink()
 
         return requirements
 
@@ -650,6 +1197,7 @@ output file to signal completion.
             List of parsed requirements
         """
         requirements = []
+        skipped = 0
 
         if not path.exists():
             return requirements
@@ -665,7 +1213,11 @@ output file to signal completion.
                     if req:
                         requirements.append(req)
                 except json.JSONDecodeError:
+                    skipped += 1
                     continue
+
+        if skipped > 0:
+            print(f"  Warning: Skipped {skipped} malformed JSON line(s) in output file.")
 
         return requirements
 
@@ -744,10 +1296,52 @@ Requirements to classify:
 {json.dumps(req_list, indent=2)}
 
 Categories:
-- DISCLOSURE: Must be stated in privacy policy/notice
-- OPERATIONAL: Internal compliance process
-- TECHNICAL: System and UI implementation requirements (includes website/app design)
-- ENFORCEMENT: Penalties, prohibited conduct, AG authority, cure periods
+
+1. DISCLOSURE: Requirements that must be stated in a privacy policy or notice
+   - Categories of data collected
+   - Purposes for processing
+   - Consumer rights available
+   - Third party sharing
+   - Sale of data statement
+   - Retention periods
+   - Contact information
+
+2. OPERATIONAL: Internal compliance processes (NOT in policy)
+   - Response timeframes (45 days, 90 days, etc.)
+   - Free request limits per year
+   - Appeal process deadlines
+   - Consent revocation processing time
+   - Internal assessment requirements
+
+3. TECHNICAL: System, UI, and website implementation requirements
+   - GPC/Universal opt-out signal recognition
+   - Security measure implementations
+   - Data deletion technical processes
+   - Age verification systems
+   - "Clear and conspicuous link" placements
+   - Opt-out button locations
+   - Cookie banner requirements
+   - Dark pattern prohibitions
+   - Any website/app design or UX requirements
+
+4. LEGAL_FRAMEWORK: Applicability, exemptions, scope, enforcement, and regulatory administration
+   - Applicability thresholds (consumer volume, revenue, data volume)
+   - Entity exemptions (nonprofits, government, small businesses)
+   - Data-type exemptions (HIPAA, GLBA, FCRA, FERPA, DPPA carve-outs)
+   - Scope limitations (what data types are covered, geographic reach)
+   - Civil penalties and fine amounts
+   - Criminal prohibitions ("it shall be unlawful...")
+   - Attorney General authority and enforcement powers
+   - Cure periods and right-to-cure provisions
+   - Private right of action (or lack thereof)
+   - Penalty multipliers or aggravating factors
+   - Injunctive relief provisions
+
+CLASSIFICATION RULES:
+- If it must appear in the privacy policy TEXT, it's DISCLOSURE
+- If it's about HOW QUICKLY to respond, it's OPERATIONAL
+- If it's about SYSTEM BEHAVIOR, UI DESIGN, or WHERE TO PLACE something on a website, it's TECHNICAL
+- If it defines WHO MUST COMPLY, WHAT IS EXEMPT, PENALTIES, PROHIBITED CONDUCT, or WHO ENFORCES the law, it's LEGAL_FRAMEWORK
 
 Return a JSON array of classifications:
 [
@@ -883,6 +1477,7 @@ Return a JSON array of classifications:
                 applies_to=data.get("applies_to", "controller"),
                 conditions=data.get("conditions", []),
                 source_section=data.get("source_section", ""),
+                obligation_type=data.get("obligation_type", ""),
             )
         except Exception:
             return None

@@ -19,6 +19,7 @@ class SectionType(str, Enum):
     ENFORCEMENT = "enforcement"
     GENERAL = "general"
     PREAMBLE = "preamble"
+    LEGISLATIVE_INTENT = "legislative_intent"
     OTHER = "other"
 
 
@@ -55,6 +56,56 @@ class Definition:
             section=data.get("section", ""),
             notes=data.get("notes", ""),
         )
+
+
+@dataclass
+class LegislativeIntent:
+    """Legislative intent, purpose, or findings from the statute.
+
+    Many statutes include sections titled "Purpose", "Findings",
+    "Legislative intent", or "Declaration of policy" that explain
+    what the statute is meant to do and why it exists.
+
+    Attributes:
+        purpose: The stated purpose or policy goal
+        findings: Individual legislative findings
+        source_sections: Section IDs where intent was found
+        raw_text: Original text for audit
+    """
+    purpose: str = ""
+    findings: list[str] = field(default_factory=list)
+    source_sections: list[str] = field(default_factory=list)
+    raw_text: str = ""
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary representation."""
+        return {
+            "purpose": self.purpose,
+            "findings": self.findings,
+            "source_sections": self.source_sections,
+            "raw_text": self.raw_text,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LegislativeIntent":
+        """Create LegislativeIntent from dictionary."""
+        return cls(
+            purpose=data.get("purpose", ""),
+            findings=data.get("findings", []),
+            source_sections=data.get("source_sections", []),
+            raw_text=data.get("raw_text", ""),
+        )
+
+    def summary(self) -> str:
+        """Return a concise summary of the legislative intent."""
+        parts = []
+        if self.purpose:
+            parts.append(f"Purpose: {self.purpose}")
+        if self.findings:
+            parts.append(f"Findings ({len(self.findings)}): {'; '.join(self.findings[:3])}")
+            if len(self.findings) > 3:
+                parts[-1] += f" ... and {len(self.findings) - 3} more"
+        return " | ".join(parts) if parts else "No legislative intent found."
 
 
 @dataclass
@@ -129,6 +180,7 @@ class StatuteStructure:
     sections: list[StatuteSection] = field(default_factory=list)
     definitions: dict[str, Definition] = field(default_factory=dict)
     raw_text: str = ""
+    legislative_intent: Optional[LegislativeIntent] = None
 
     def get_section_by_type(self, section_type: SectionType) -> list[StatuteSection]:
         """Get all sections of a given type."""
@@ -141,13 +193,16 @@ class StatuteStructure:
 
     def to_dict(self) -> dict:
         """Convert to dictionary representation."""
-        return {
+        result = {
             "name": self.name,
             "citation": self.citation,
             "effective_date": self.effective_date,
             "sections": [s.to_dict() for s in self.sections],
             "definitions": {k: v.to_dict() for k, v in self.definitions.items()},
         }
+        if self.legislative_intent:
+            result["legislative_intent"] = self.legislative_intent.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, data: dict) -> "StatuteStructure":
@@ -168,6 +223,10 @@ class StatuteStructure:
                     if term:
                         definitions[term] = Definition.from_dict(d)
 
+        # Parse legislative intent if present
+        intent_data = data.get("legislative_intent")
+        legislative_intent = LegislativeIntent.from_dict(intent_data) if isinstance(intent_data, dict) else None
+
         return cls(
             name=data.get("name", data.get("statute_name", "Unknown Statute")),
             citation=data.get("citation", ""),
@@ -175,6 +234,7 @@ class StatuteStructure:
             sections=[StatuteSection.from_dict(s) for s in data.get("sections", [])],
             definitions=definitions,
             raw_text=data.get("raw_text", ""),
+            legislative_intent=legislative_intent,
         )
 
 
@@ -196,6 +256,7 @@ class AnalysisResult:
     definitions: dict[str, Definition] = field(default_factory=dict)
     requirements: list[Requirement] = field(default_factory=list)
     structure: Optional[StatuteStructure] = None
+    legislative_intent: Optional[LegislativeIntent] = None
     unverified_items: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
@@ -220,13 +281,13 @@ class AnalysisResult:
         """Get only operational requirements."""
         return [r for r in self.requirements if r.is_operational_requirement()]
 
-    def to_dict(self, include_structure: bool = False) -> dict:
+    def to_dict(self, include_structure: bool = True) -> dict:
         """Convert to dictionary representation.
 
         Args:
             include_structure: If True, include the full statute structure
-                (sections with raw content). Defaults to False to reduce
-                output size since structure duplicates the statute text.
+                (sections with IDs, types, titles, and line ranges).
+                Defaults to True so the viewer Structure tab works.
         """
         result = {
             "statute_name": self.statute_name,
@@ -236,6 +297,8 @@ class AnalysisResult:
             "unverified_items": self.unverified_items,
             "metadata": self.metadata,
         }
+        if self.legislative_intent:
+            result["legislative_intent"] = self.legislative_intent.to_dict()
         if include_structure:
             result["structure"] = self.structure.to_dict() if self.structure else None
         return result
@@ -243,12 +306,17 @@ class AnalysisResult:
     @classmethod
     def from_dict(cls, data: dict) -> "AnalysisResult":
         """Create AnalysisResult from dictionary."""
+        # Parse legislative intent if present
+        intent_data = data.get("legislative_intent")
+        legislative_intent = LegislativeIntent.from_dict(intent_data) if isinstance(intent_data, dict) else None
+
         return cls(
             statute_name=data["statute_name"],
             effective_date=data.get("effective_date", ""),
             definitions={k: Definition.from_dict(v) for k, v in data.get("definitions", {}).items()},
             requirements=[Requirement.from_dict(r) for r in data.get("requirements", [])],
             structure=StatuteStructure.from_dict(data["structure"]) if data.get("structure") else None,
+            legislative_intent=legislative_intent,
             unverified_items=data.get("unverified_items", []),
             metadata=data.get("metadata", {}),
         )
@@ -274,6 +342,25 @@ class AnalysisResult:
             f"- **Definitions Extracted:** {len(self.definitions)}",
             "",
         ])
+
+        # Legislative Intent
+        if self.legislative_intent:
+            lines.extend([
+                "## Legislative Intent",
+                "",
+            ])
+            if self.legislative_intent.purpose:
+                lines.append(f"**Purpose:** {self.legislative_intent.purpose}")
+                lines.append("")
+            if self.legislative_intent.findings:
+                lines.append("**Findings:**")
+                lines.append("")
+                for finding in self.legislative_intent.findings:
+                    lines.append(f"- {finding}")
+                lines.append("")
+            if self.legislative_intent.source_sections:
+                lines.append(f"*Source sections: {', '.join(self.legislative_intent.source_sections)}*")
+                lines.append("")
 
         # Requirements by category
         lines.extend([

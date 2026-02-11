@@ -36,7 +36,7 @@ Concise checklist for extracting requirements from privacy/tech statutes.
 1. Does it describe **what the policy must say**? -> DISCLOSURE
 2. Does it describe **how fast or how often** to do something? -> OPERATIONAL
 3. Does it describe **system behavior** or **where/how to display** something? -> TECHNICAL
-4. Does it define **penalties**, **prohibited conduct**, or **enforcement authority**? -> ENFORCEMENT
+4. Does it define **who must comply**, **what is exempt**, **penalties**, **prohibited conduct**, or **enforcement authority**? -> LEGAL_FRAMEWORK
 
 ## Consolidation Rules
 
