@@ -428,10 +428,15 @@ class CitationVerifier:
 
     def _find_line_numbers(self, normalized_text: str) -> tuple[int, int]:
         """Find line numbers where normalized text appears."""
-        # First try single-line match
+        # First try single-line match (quote contained in one line)
         for i, line in enumerate(self.normalized_lines):
-            if normalized_text in line or line in normalized_text:
+            if normalized_text in line:
                 return (i + 1, i + 1)
+
+        # Try position-based lookup via character offset in normalized text
+        pos = self.normalized_text.find(normalized_text)
+        if pos != -1:
+            return self._position_to_lines(pos, len(normalized_text))
 
         # Try in joined blocks
         for block_text, start_line, end_line in self.joined_paragraphs:
@@ -442,10 +447,16 @@ class CitationVerifier:
 
     def _find_line_numbers_aggressive(self, aggressive_text: str) -> tuple[int, int]:
         """Find line numbers using aggressive normalization."""
+        # Only match when the quote fits inside a single line
         for i, line in enumerate(self.lines):
             line_aggressive = self._normalize(line, level="aggressive")
-            if aggressive_text in line_aggressive or line_aggressive in aggressive_text:
+            if aggressive_text in line_aggressive:
                 return (i + 1, i + 1)
+
+        # For multi-line quotes, use position-based lookup
+        pos = self.aggressive_text.find(aggressive_text)
+        if pos != -1:
+            return self._position_to_lines(pos, len(aggressive_text))
 
         return (0, 0)
 

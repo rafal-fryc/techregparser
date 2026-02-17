@@ -114,9 +114,9 @@ Return classifications in JSON format."""
 
 
 # Model constants
-MODEL_OPUS = "opus"
-MODEL_SONNET = "sonnet"
-MODEL_HAIKU = "haiku"
+MODEL_OPUS = "claude-opus-4-6"
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU = "claude-haiku-4-5-20251001"
 
 
 # Agent definitions for the SDK
@@ -172,6 +172,9 @@ class OrchestratorConfig:
     model: str = MODEL_OPUS  # Orchestrator uses Opus
     use_memory: bool = True  # Store/load patterns from previous runs
     use_cache: bool = True  # Cache Phase 1 structure for re-runs
+    reextract_confidence_threshold: float = 0.99  # Re-extract below this
+    max_reextract_passes: int = 2                 # Max retry loops
+    verify_definitions: bool = True               # Check Phase 1 definitions
 
 
 # Key statutory interpretation principles from Part 9

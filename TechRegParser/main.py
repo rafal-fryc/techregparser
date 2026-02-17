@@ -137,6 +137,20 @@ Examples:
     )
 
     parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.99,
+        help="Minimum citation confidence (0.0-1.0). Below triggers re-extraction. "
+             "Set to 0.0 to disable. (default: 0.99)",
+    )
+
+    parser.add_argument(
+        "--no-reextract",
+        action="store_true",
+        help="Disable confidence-based re-extraction",
+    )
+
+    parser.add_argument(
         "--parallel", "-p",
         type=int,
         default=1,
@@ -348,6 +362,7 @@ async def main():
         classify_requirements=not args.no_classify,
         use_memory=not args.no_memory,
         use_cache=not args.no_cache,
+        reextract_confidence_threshold=0.0 if args.no_reextract else args.min_confidence,
     )
 
     try:

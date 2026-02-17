@@ -5,10 +5,12 @@ import hashlib
 import json
 import re
 import tempfile
+from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional, AsyncIterator, Any
 
-from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+from claude_agent_sdk import query, ClaudeAgentOptions
 
 from ..config import (
     AGENT_CONFIGS,
@@ -42,6 +44,14 @@ except ImportError:
     except ImportError:
         PDF_SUPPORT = False
 
+# OCR fallback (optional — used when PDF has no extractable text)
+try:
+    from marker.converters.pdf import PdfConverter
+    from marker.models import create_model_dict
+    OCR_SUPPORT = True
+except ImportError:
+    OCR_SUPPORT = False
+
 
 # Default retry settings
 DEFAULT_MAX_RETRIES = 3
@@ -67,23 +77,7 @@ class TechRegParserOrchestrator:
             config: Configuration options for the orchestrator
         """
         self.config = config or OrchestratorConfig()
-        self._setup_agents()
         self._memory: dict[str, Any] = {}
-
-    def _setup_agents(self):
-        """Set up the agent definitions for the SDK.
-
-        All subagents use Sonnet or Haiku, while the orchestrator uses Opus.
-        """
-        self.agents = {}
-
-        for name, agent_config in AGENT_CONFIGS.items():
-            self.agents[name] = AgentDefinition(
-                description=agent_config.description,
-                prompt=agent_config.prompt,
-                tools=agent_config.tools,
-                model=agent_config.model,
-            )
 
     def _load_memory(self) -> dict[str, Any]:
         """Load session memory from disk.
@@ -246,6 +240,7 @@ class TechRegParserOrchestrator:
         return ClaudeAgentOptions(
             allowed_tools=agent_config.tools,
             model=agent_config.model,
+            system_prompt=agent_config.prompt,
             setting_sources=["project"],
             cwd=self.config.working_directory,
             permission_mode="bypassPermissions",
@@ -259,7 +254,6 @@ class TechRegParserOrchestrator:
         """
         return ClaudeAgentOptions(
             allowed_tools=["Read", "Grep", "Glob", "Task", "Write"],
-            agents=self.agents,
             setting_sources=["project"],
             permission_mode="bypassPermissions",
             cwd=self.config.working_directory,
@@ -310,6 +304,15 @@ class TechRegParserOrchestrator:
                 print("           Phase 2 will proceed without section context.")
             elif structure.sections:
                 print(f"  Found {len(structure.sections)} sections, {len(structure.definitions)} definitions")
+                self._save_structure_cache(statute_path, structure)
+
+        # Phase 1.5: Definition Verification + Re-extraction
+        if structure and structure.definitions and self.config.verify_definitions:
+            corrections = await self._verify_and_reextract_definitions(
+                structure, statute_text, statute_path
+            )
+            if corrections:
+                # Update structure cache with corrected definitions
                 self._save_structure_cache(statute_path, structure)
 
         # Phase 2: Extract Requirements
@@ -365,6 +368,7 @@ class TechRegParserOrchestrator:
         if needs_backfill and output_file:
             requirements = await self._check_completeness_and_backfill(
                 requirements, structure, statute_path, output_file,
+                statute_text=statute_text,
             )
             # Re-apply caps after backfill
             requirements = self._enforce_section_caps(requirements, structure)
@@ -429,6 +433,14 @@ class TechRegParserOrchestrator:
                 if req.id in category_map:
                     req.category = category_map[req.id]
 
+        # Phase 3.5: Confidence-based re-extraction
+        reextract_improved = 0
+        threshold = self.config.reextract_confidence_threshold
+        if threshold > 0.0 and self.config.verify_citations:
+            reextract_improved = await self._reextract_low_confidence_sections(
+                requirements, statute_text, structure, statute_path
+            )
+
         # Rebuild extraction metadata with final requirement list
         final_extraction_meta = self._build_extraction_metadata(requirements, structure)
 
@@ -446,6 +458,8 @@ class TechRegParserOrchestrator:
                 "total_requirements": len(requirements),
                 "verified_count": len([r for r in requirements if r.verified]),
                 "output_format": output_format,
+                "reextraction_threshold": threshold if threshold > 0.0 else None,
+                "reextraction_improved": reextract_improved,
                 **final_extraction_meta,
             },
         )
@@ -546,7 +560,32 @@ class TechRegParserOrchestrator:
         except Exception as e:
             raise ValueError(f"Failed to read PDF: {e}")
 
-        return ""
+        if not text_parts:
+            if not OCR_SUPPORT:
+                raise ValueError(
+                    f"No text extracted from PDF: {path}. "
+                    "The file may be image-based (scanned). "
+                    "Install marker-pdf for automatic OCR: pip install marker-pdf"
+                )
+            print(f"  No embedded text found — running OCR with marker-pdf...")
+            text = self._ocr_pdf(path)
+            if not text.strip():
+                raise ValueError(
+                    f"OCR produced no text for PDF: {path}. "
+                    "The file may be blank or corrupt."
+                )
+            return text
+
+    def _ocr_pdf(self, path: Path) -> str:
+        """OCR a scanned PDF using marker-pdf.
+
+        Only called when pdfplumber and pypdf extract no text.
+        """
+        converter = PdfConverter(artifact_dict=create_model_dict())
+        result = converter(str(path))
+        text = result.markdown
+        print(f"  OCR complete: {len(text)} chars from {path.name}")
+        return text
 
     async def _analyze_structure(
         self,
@@ -615,13 +654,67 @@ Return your analysis as a JSON object with:
             if hasattr(message, "result"):
                 try:
                     result_text = message.result
+                    if not result_text:
+                        print("  Phase 1: Agent returned empty result")
+                        continue
                     json_match = self._extract_json(result_text)
                     if json_match:
                         structure_data = json.loads(json_match)
                     else:
                         print(f"  Phase 1: No JSON found in agent response ({len(result_text)} chars)")
+                        print(f"  Phase 1: Response preview: {result_text[:300]}...")
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"  Phase 1: JSON parse error: {e}")
+
+        # Corrective retry: if first attempt returned prose instead of JSON,
+        # send a targeted follow-up with an explicit JSON template.
+        if structure_data is None:
+            print("  Phase 1: Retrying with corrective prompt...")
+            corrective_prompt = f"""Your previous response was not valid JSON. I need ONLY a JSON object.
+
+The statute text is at: {statute_text_file.absolute()}
+Use the Read tool to re-read it if needed.
+
+CRITICAL: Output ONLY the JSON object below, filled in with real data from the statute. No prose, no explanation, no markdown fences.
+
+{{
+  "name": "<statute name>",
+  "citation": "<official citation or null>",
+  "effective_date": "<effective date or null>",
+  "sections": [
+    {{
+      "id": "<section number as it appears in text>",
+      "title": "<section title>",
+      "section_type": "<one of: definitions, applicability, consumer_rights, controller_duties, processor_duties, exemptions, enforcement, general, preamble, legislative_intent, other>",
+      "content": "<first 200 chars of section content>",
+      "start_line": 0,
+      "end_line": 0
+    }}
+  ],
+  "definitions": {{
+    "<term>": {{
+      "term": "<term>",
+      "definition": "<exact statutory text>",
+      "section": "<section number>"
+    }}
+  }}
+}}"""
+            async for message in query(prompt=corrective_prompt, options=options):
+                if hasattr(message, "result"):
+                    try:
+                        result_text = message.result
+                        if not result_text:
+                            print("  Phase 1: Corrective retry returned empty result")
+                            continue
+                        json_match = self._extract_json(result_text)
+                        if json_match:
+                            structure_data = json.loads(json_match)
+                            print("  Phase 1: Corrective retry succeeded")
+                        else:
+                            print(f"  Phase 1: Corrective retry also failed ({len(result_text)} chars)")
+                            print(f"  Phase 1: Response preview: {result_text[:300]}...")
+                    except (json.JSONDecodeError, ValueError) as e:
+                        print(f"  Phase 1: Corrective retry JSON parse error: {e}")
 
         # Clean up statute text temp file
         if statute_text_file.exists():
@@ -695,12 +788,26 @@ If the file doesn't exist yet or is empty, just write your new lines.
 
 Each JSON object must contain:
 - description: human-readable description
-- citation: {{ "section": "...", "quoted_text": "..." }}
+- citation: {{ "section": "...", "quote_start_line": <int>, "quote_end_line": <int> }}
 - applies_to: who it applies to
 - conditions: list of conditions
 - category: one of the following (see definitions below)
 - source_section: the section ID this item came from
 - obligation_type: "shall" | "shall_not" | "may" | "must" | "may_not" (the verb form)
+
+LINE NUMBER RULES:
+- quote_start_line / quote_end_line are the line numbers visible in the Read tool output
+  (the numbers in the left column when you read the statute file)
+- These must be the EXACT lines where the relevant statutory text appears
+- The orchestrator will extract the verbatim text from these lines automatically
+- Do NOT write a "quoted_text" field — it will be filled in for you from the line numbers
+- If the provision spans part of a line, include the full line — precision will be handled downstream
+- VERIFY: After identifying lines, re-read those specific lines to confirm they contain the provision
+
+DESCRIPTION ACCURACY:
+- The "description" field must accurately reflect the ACTUAL statutory text at the cited lines
+- Read the lines first, then write the description based on what you see — not from memory
+- Do NOT paraphrase or generalize beyond what the statute text actually says
 
 Categories:
 - disclosure: Must appear in privacy policy/notice text (data categories, purposes,
@@ -712,7 +819,7 @@ Categories:
 - legal_framework: Applicability thresholds, entity/data exemptions, scope rules,
   penalties, AG authority, cure periods, private right of action provisions
 
-CRITICAL: Every item MUST have a direct quote from the statute.
+CRITICAL: Every item MUST have line numbers pointing to the statute text.
 
 WHAT TO EXTRACT:
 1. REQUIREMENTS (category: disclosure/operational/technical) — affirmative
@@ -724,7 +831,7 @@ WHAT TO EXTRACT:
    - EXEMPTIONS: Entity-level exemptions (e.g., nonprofits, government,
      HIPAA-covered entities) and data-level exemptions (e.g., employee data,
      publicly available info, de-identified data). Consolidate each exemption
-     section into one item with the full list in quoted_text.
+     section into one item with line numbers spanning the full list.
    - ENFORCEMENT: Penalties, AG authority, cure periods, private right of action
      (or lack thereof)
 
@@ -732,9 +839,8 @@ CONSOLIDATION RULES:
 - When a statute lists multiple items under a single subsection (e.g., "may not
   do any of the following: (1)... (2)... (3)..."), extract ONE item that
   covers the entire list, not separate items per sub-item.
-- For the quoted_text field: quote the parent clause plus the full enumerated
-  list. If the list is very long, quote the parent clause and a representative
-  excerpt with "..." to indicate continuation.
+- Set quote_start_line to the parent clause and quote_end_line to the last
+  item in the enumerated list to capture the full provision.
 - Skip cross-references: if a section says "must comply with Section X" and you
   already extracted Section X's content, do NOT create a separate item for the
   cross-reference.
@@ -850,6 +956,9 @@ Use the section_type field to guide extraction:
         # Read requirements from the JSONL output file
         requirements = self._read_requirements_file(output_file)
 
+        # Phase 2.1: Deterministic quote resolution from line numbers
+        requirements = self._resolve_citations(requirements, statute_text)
+
         if not requirements:
             print("  Warning: No requirements parsed from output file. "
                   "The section-analyzer may have overwritten earlier results.")
@@ -924,7 +1033,6 @@ Use the section_type field to guide extraction:
             phase1_ids = {s.id for s in structure.sections}
 
         # Group by normalized section ID
-        from collections import defaultdict
         groups: dict[str, list[int]] = defaultdict(list)
         for idx, req in enumerate(requirements):
             norm = self._normalize_section_id(req.source_section)
@@ -1002,6 +1110,7 @@ Use the section_type field to guide extraction:
         structure: StatuteStructure,
         statute_path: str,
         output_file: Path,
+        statute_text: str,
         max_passes: int = 2,
     ) -> list[Requirement]:
         """Check for missed sections and run backfill passes to cover them.
@@ -1014,6 +1123,7 @@ Use the section_type field to guide extraction:
             structure: Parsed statute structure from Phase 1
             statute_path: Path to the statute file
             output_file: Path to the JSONL output file
+            statute_text: The full statute text for quote resolution
             max_passes: Maximum number of backfill passes
 
         Returns:
@@ -1093,17 +1203,27 @@ Extract from ONLY these sections:
 
 Each JSON object (one per line) must contain:
 - description: human-readable description
-- citation: {{ "section": "...", "quoted_text": "..." }}
+- citation: {{ "section": "...", "quote_start_line": <int>, "quote_end_line": <int> }}
 - applies_to: who it applies to
 - conditions: list of conditions
 - category: one of (disclosure, operational, technical, legal_framework)
 - source_section: the section ID this item came from
 - obligation_type: "shall" | "shall_not" | "may" | "must" | "may_not"
 
+LINE NUMBER RULES:
+- quote_start_line / quote_end_line are the line numbers visible in the Read tool output
+- These must be the EXACT lines where the relevant statutory text appears
+- Do NOT write a "quoted_text" field — it will be filled in automatically from the line numbers
+- VERIFY: After identifying lines, re-read those specific lines to confirm they contain the provision
+
+DESCRIPTION ACCURACY:
+- The "description" field must accurately reflect the ACTUAL statutory text at the cited lines
+- Read the lines first, then write the description based on what you see — not from memory
+
 CONSOLIDATION RULES:
 - One item per statutory subsection, NOT one per sub-clause.
 - Maximum 5 items per section. Consolidate related provisions.
-- Every item MUST have a direct quote from the statute in quoted_text.
+- Every item MUST have line numbers pointing to the statute text.
 
 Use the Read tool to access the statute text at {statute_text_file.absolute()}.
 Write "DONE" as the final line when finished.
@@ -1115,8 +1235,9 @@ Write "DONE" as the final line when finished.
             async for message in query(prompt=backfill_prompt, options=options):
                 pass
 
-            # Read updated requirements
+            # Read updated requirements and resolve quotes from line numbers
             new_requirements = self._read_requirements_file(output_file)
+            new_requirements = self._resolve_citations(new_requirements, statute_text)
 
             # Deduplicate by (normalized section, description prefix)
             seen = set()
@@ -1382,6 +1503,419 @@ Return a JSON array of classifications:
 
         return categories
 
+    async def _verify_and_reextract_definitions(
+        self,
+        structure: StatuteStructure,
+        statute_text: str,
+        statute_path: str,
+    ) -> int:
+        """Phase 1.5: Verify definitions against statute text and re-extract truncated ones.
+
+        Uses CitationVerifier to check each definition's text against the statute.
+        Definitions with confidence < 0.90 are flagged as potentially truncated
+        and re-extracted with emphasis on completeness.
+
+        Args:
+            structure: The parsed statute structure (mutated in place)
+            statute_text: The full statute text
+            statute_path: Path to the statute file
+
+        Returns:
+            Number of definitions corrected
+        """
+        verifier = CitationVerifier(statute_text)
+        flagged_terms: list[str] = []
+
+        for term, defn in structure.definitions.items():
+            if not defn.definition:
+                continue
+            # Create a synthetic Citation to run through the verifier
+            citation = Citation(
+                section=defn.section,
+                quoted_text=defn.definition,
+            )
+            result = verifier.verify(citation)
+            if result.confidence < 0.90:
+                flagged_terms.append(term)
+
+        if not flagged_terms:
+            return 0
+
+        print(f"Phase 1.5: {len(flagged_terms)} definition(s) may be truncated: "
+              f"{', '.join(flagged_terms[:5])}")
+
+        corrections = await self._reextract_definitions(
+            structure, statute_text, statute_path, flagged_terms
+        )
+        return corrections
+
+    async def _reextract_definitions(
+        self,
+        structure: StatuteStructure,
+        statute_text: str,
+        statute_path: str,
+        flagged_terms: list[str],
+    ) -> int:
+        """Re-extract flagged definitions with emphasis on completeness.
+
+        Calls statute-reader (Haiku) with a targeted prompt listing only the
+        flagged terms. Only replaces originals if the new definition is longer.
+
+        Args:
+            structure: The parsed statute structure (mutated in place)
+            statute_text: The full statute text
+            statute_path: Path to the statute file
+            flagged_terms: List of term names to re-extract
+
+        Returns:
+            Number of definitions corrected
+        """
+        output_dir = Path(self.config.working_directory)
+        statute_hash = hashlib.md5(statute_path.encode()).hexdigest()[:8]
+        statute_text_file = output_dir / f".techregparser_statute_{statute_hash}.txt"
+        statute_text_file.write_text(statute_text, encoding="utf-8")
+
+        terms_listing = "\n".join(
+            f"- \"{term}\" (current: {len(structure.definitions[term].definition)} chars)"
+            for term in flagged_terms
+        )
+
+        prompt = f"""Re-extract the following definitions from the statute.
+The CURRENT definitions appear to be TRUNCATED or incomplete.
+
+The statute text is at: {statute_text_file.absolute()}
+Use the Read tool to access the statute text.
+
+Terms to re-extract:
+{terms_listing}
+
+CRITICAL INSTRUCTIONS:
+- Copy the COMPLETE definition text, including ALL sub-clauses, provisos, and exceptions.
+- If a definition has sub-paragraphs (e.g., "For purposes of this paragraph, 'control' means..."),
+  you MUST include those sub-paragraphs in the definition text.
+- Do NOT summarize or paraphrase. Copy the EXACT statutory text.
+- Include everything from the opening of the definition through the last related sub-clause.
+
+Return a JSON object where each key is the defined term and the value is an object with:
+- "term": the defined term
+- "definition": the COMPLETE exact statutory definition text
+- "section": the section number where this definition appears
+"""
+
+        options = self._get_subagent_options("statute-reader")
+
+        new_definitions = None
+        async for message in query(prompt=prompt, options=options):
+            if hasattr(message, "result"):
+                try:
+                    result_text = message.result
+                    json_match = self._extract_json(result_text)
+                    if json_match:
+                        new_definitions = json.loads(json_match)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        # Clean up temp file
+        if statute_text_file.exists():
+            statute_text_file.unlink()
+
+        if not new_definitions:
+            print("  Phase 1.5: Re-extraction returned no results")
+            return 0
+
+        corrections = 0
+        for term in flagged_terms:
+            new_data = new_definitions.get(term)
+            if not new_data:
+                continue
+            new_def_text = new_data.get("definition", "")
+            old_def_text = structure.definitions[term].definition
+            # Only replace if the new definition is longer (more complete)
+            if len(new_def_text) > len(old_def_text):
+                structure.definitions[term] = Definition(
+                    term=term,
+                    definition=new_def_text,
+                    section=new_data.get("section", structure.definitions[term].section),
+                )
+                corrections += 1
+                print(f"  Phase 1.5: Corrected \"{term}\" "
+                      f"({len(old_def_text)} -> {len(new_def_text)} chars)")
+
+        return corrections
+
+    async def _reextract_low_confidence_sections(
+        self,
+        requirements: list[Requirement],
+        statute_text: str,
+        structure: Optional[StatuteStructure],
+        statute_path: str,
+    ) -> int:
+        """Phase 3.5: Re-extract requirements from sections with low citation confidence.
+
+        Filters requirements below the confidence threshold, groups by section,
+        does targeted re-extraction, and merges improvements.
+
+        Args:
+            requirements: The full requirement list (mutated in place on improvement)
+            statute_text: The full statute text
+            structure: Parsed statute structure
+            statute_path: Path to the statute file
+
+        Returns:
+            Number of requirements improved
+        """
+        threshold = self.config.reextract_confidence_threshold
+        max_passes = self.config.max_reextract_passes
+        total_improved = 0
+
+        for pass_num in range(1, max_passes + 1):
+            # Filter low-confidence requirements
+            low_conf = [
+                r for r in requirements
+                if r.confidence < threshold and r.confidence > 0.0
+            ]
+            if not low_conf:
+                break
+
+            # Group by normalized source section
+            section_groups: dict[str, list[Requirement]] = defaultdict(list)
+            for req in low_conf:
+                norm = self._normalize_section_id(req.source_section or req.citation.section)
+                section_groups[norm].append(req)
+
+            print(f"Phase 3.5: Pass {pass_num}/{max_passes} — "
+                  f"{len(low_conf)} requirement(s) below {threshold:.2f} confidence "
+                  f"in {len(section_groups)} section(s)")
+
+            pass_improved = 0
+            for section_id, section_reqs in section_groups.items():
+                # Find section metadata from Phase 1
+                section_meta = None
+                if structure and structure.sections:
+                    for s in structure.sections:
+                        if self._normalize_section_id(s.id) == section_id:
+                            section_meta = s
+                            break
+
+                # Targeted re-extraction
+                new_reqs = await self._targeted_reextract_section(
+                    section_id, section_reqs, section_meta,
+                    statute_text, statute_path,
+                )
+                if not new_reqs:
+                    continue
+
+                # Re-verify the new extractions
+                verifier = CitationVerifier(statute_text)
+                for req in new_reqs:
+                    result = verifier.verify(req.citation)
+                    req.verified = result.valid
+                    req.confidence = result.confidence
+                    req.citation.verified = result.valid
+                    req.citation.confidence = result.confidence
+                    req.citation.match_type = result.match_type
+                    if result.line_numbers:
+                        req.citation.line_numbers = result.line_numbers
+
+                # Merge improvements
+                improved = self._merge_reextracted(requirements, section_reqs, new_reqs)
+                pass_improved += improved
+
+            total_improved += pass_improved
+            if pass_improved == 0:
+                print(f"  Phase 3.5: No improvements in pass {pass_num}, stopping")
+                break
+            else:
+                print(f"  Phase 3.5: Pass {pass_num} improved {pass_improved} requirement(s)")
+
+        return total_improved
+
+    async def _targeted_reextract_section(
+        self,
+        section_id: str,
+        original_reqs: list[Requirement],
+        section_meta: Optional["StatuteSection"],
+        statute_text: str,
+        statute_path: str,
+    ) -> list[Requirement]:
+        """Re-extract requirements from a single section with emphasis on verbatim quoting.
+
+        Args:
+            section_id: Normalized section ID
+            original_reqs: The original low-confidence requirements from this section
+            section_meta: Phase 1 section metadata (if available)
+            statute_text: The full statute text
+            statute_path: Path to the statute file
+
+        Returns:
+            List of newly extracted requirements
+        """
+        output_dir = Path(self.config.working_directory)
+        statute_hash = hashlib.md5(statute_path.encode()).hexdigest()[:8]
+        safe_section = re.sub(r'[^\w]', '_', section_id)
+        reextract_file = output_dir / f".techregparser_reextract_{statute_hash}_{safe_section}.jsonl"
+        statute_text_file = output_dir / f".techregparser_statute_{statute_hash}.txt"
+
+        # Write statute text if not already present
+        if not statute_text_file.exists():
+            statute_text_file.write_text(statute_text, encoding="utf-8")
+
+        # Build context about what was previously extracted
+        prev_context = []
+        for req in original_reqs:
+            prev_context.append({
+                "description": req.description,
+                "confidence": req.confidence,
+                "match_type": req.citation.match_type,
+                "quoted_text_preview": req.citation.quoted_text[:100] + "..."
+                    if len(req.citation.quoted_text) > 100
+                    else req.citation.quoted_text,
+            })
+
+        section_info = ""
+        if section_meta:
+            section_info = (
+                f"\nSection metadata from structure analysis:\n"
+                f"- Title: {section_meta.title}\n"
+                f"- Type: {section_meta.section_type.value}\n"
+                f"- Line range: {section_meta.start_line}-{section_meta.end_line}\n"
+            )
+
+        prompt = f"""Re-extract requirements from Section {section_id} of this statute.
+
+The statute text is at: {statute_text_file.absolute()}
+Use the Read tool to access the statute text.
+{section_info}
+PREVIOUS EXTRACTION HAD LOW CONFIDENCE:
+{json.dumps(prev_context, indent=2)}
+
+The quoted_text fields in the previous extraction did NOT match the statute text well.
+This usually means the text was paraphrased, reconstructed from memory, or truncated.
+
+YOUR TASK: Re-extract requirements from this section using LINE NUMBERS for quoting.
+
+LINE NUMBER RULES (CRITICAL):
+- Use quote_start_line / quote_end_line instead of quoted_text
+- These are the line numbers visible in the Read tool output (left column numbers)
+- The orchestrator will extract verbatim text from these lines automatically
+- Do NOT write a "quoted_text" field — it will be filled in for you from the line numbers
+- VERIFY: After identifying lines, re-read those specific lines to confirm they contain the provision
+- If a provision spans part of a line, include the full line — precision will be handled downstream
+
+DESCRIPTION ACCURACY:
+- The "description" field must accurately reflect the ACTUAL statutory text at the cited lines
+- Read the lines first, then write the description based on what you see — not from memory
+
+Output file: {reextract_file}
+
+Format: One JSON object per line (JSONL). Each line:
+- description: human-readable description
+- citation: {{ "section": "...", "quote_start_line": <int>, "quote_end_line": <int> }}
+- applies_to: who it applies to
+- conditions: list of conditions
+- category: one of (disclosure, operational, technical, legal_framework)
+- source_section: the section ID
+- obligation_type: "shall" | "shall_not" | "may" | "must" | "may_not"
+
+Write results to the output file. Write "DONE" as the final line when finished.
+"""
+
+        options = self._get_subagent_options("section-analyzer")
+
+        try:
+            async for message in query(prompt=prompt, options=options):
+                pass
+        except Exception as e:
+            print(f"  Phase 3.5: Re-extraction failed for section {section_id}: {e}")
+            return []
+
+        # Read results and resolve quotes from line numbers
+        new_reqs = self._read_requirements_file(reextract_file)
+        new_reqs = self._resolve_citations(new_reqs, statute_text)
+
+        # Clean up
+        if reextract_file.exists():
+            reextract_file.unlink()
+
+        return new_reqs
+
+    def _merge_reextracted(
+        self,
+        all_requirements: list[Requirement],
+        original_reqs: list[Requirement],
+        new_reqs: list[Requirement],
+    ) -> int:
+        """Merge re-extracted requirements into the main list with safeguards.
+
+        Three safeguards against degradation:
+        1. Average confidence guard: skip entire merge if avg new < avg original
+        2. Per-requirement guard: only replace if new.confidence > original.confidence
+        3. Description similarity guard: match by SequenceMatcher ratio >= 0.50
+
+        Preserves original requirement ID and category during replacement.
+
+        Args:
+            all_requirements: The full requirement list (mutated in place)
+            original_reqs: The original low-confidence requirements from this section
+            new_reqs: The newly extracted requirements
+
+        Returns:
+            Number of requirements improved
+        """
+        if not new_reqs or not original_reqs:
+            return 0
+
+        # Safeguard 1: Average confidence guard
+        avg_original = sum(r.confidence for r in original_reqs) / len(original_reqs)
+        avg_new = sum(r.confidence for r in new_reqs) / len(new_reqs)
+        if avg_new < avg_original:
+            return 0
+
+        # Build index of original reqs in the main list for in-place replacement
+        orig_indices: dict[str, int] = {}
+        for i, req in enumerate(all_requirements):
+            if req.id in {r.id for r in original_reqs}:
+                orig_indices[req.id] = i
+
+        improved = 0
+        used_new = set()
+
+        for orig in original_reqs:
+            if orig.id not in orig_indices:
+                continue
+
+            # Safeguard 3: Find best matching new requirement by description similarity
+            best_match = None
+            best_ratio = 0.0
+            for j, new_req in enumerate(new_reqs):
+                if j in used_new:
+                    continue
+                ratio = SequenceMatcher(
+                    None, orig.description.lower(), new_req.description.lower()
+                ).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_match = (j, new_req)
+
+            if best_match is None or best_ratio < 0.50:
+                continue
+
+            j, new_req = best_match
+
+            # Safeguard 2: Per-requirement confidence guard
+            if new_req.confidence <= orig.confidence:
+                continue
+
+            # Replace in main list, preserving ID and category
+            idx = orig_indices[orig.id]
+            new_req.id = orig.id
+            new_req.category = orig.category
+            all_requirements[idx] = new_req
+            used_new.add(j)
+            improved += 1
+
+        return improved
+
     def _build_extraction_metadata(
         self,
         requirements: list[Requirement],
@@ -1462,6 +1996,11 @@ Return a JSON array of classifications:
                     quoted_text=citation_data.get("quoted_text", ""),
                     context=citation_data.get("context", ""),
                 )
+                # Store line numbers for _resolve_citations to use
+                quote_start = citation_data.get("quote_start_line")
+                quote_end = citation_data.get("quote_end_line")
+                if quote_start and quote_end:
+                    citation.line_numbers = (int(quote_start), int(quote_end))
 
             # Parse category
             cat_str = data.get("category", "unclassified").lower()
@@ -1482,8 +2021,51 @@ Return a JSON array of classifications:
         except Exception:
             return None
 
+    def _resolve_citations(
+        self,
+        requirements: list[Requirement],
+        statute_text: str,
+    ) -> list[Requirement]:
+        """Fill in quoted_text from line numbers deterministically.
+
+        For each requirement that has line_numbers (from quote_start_line/
+        quote_end_line) but no quoted_text, extracts the exact text from
+        the statute. If both are present, line-number text overrides.
+
+        Falls back gracefully if line numbers are missing or invalid.
+
+        Args:
+            requirements: List of requirements to resolve
+            statute_text: The full statute text
+
+        Returns:
+            The same list with quoted_text filled in
+        """
+        lines = statute_text.split("\n")
+        resolved = 0
+
+        for req in requirements:
+            start_end = req.citation.line_numbers
+            if not start_end:
+                continue
+
+            start, end = start_end
+            if start and end and 1 <= start <= len(lines) and start <= end <= len(lines):
+                # Extract exact text from line range (1-indexed)
+                extracted = "\n".join(lines[start - 1 : end]).strip()
+                req.citation.quoted_text = extracted
+                req.citation.line_numbers = (start, end)
+                resolved += 1
+
+        if resolved:
+            print(f"  Quote resolution: filled {resolved}/{len(requirements)} citations from line numbers")
+
+        return requirements
+
     def _extract_json(self, text: str) -> Optional[str]:
         """Extract JSON from text that might contain other content."""
+        if not text:
+            return None
         # First try to extract from markdown code blocks
         code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
         if code_block_match:
